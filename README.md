@@ -7,6 +7,11 @@ real curvature of the Earth.
 Status: beta (see VERSION). Tested on BeamNG.drive 0.40.4 on Linux (Vulkan) and 0.40.3 on the Steam Deck. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is coming.
 
+**This fork** of [TecnaGamer/BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth) adds a Google Maps integration
+to the world map: open a spot, its Street View or your GPS route in Google Maps, send them to your phone as a QR code,
+and paste your phone's Google Maps share links into the map. It uses only Google's Maps links (no API key, nothing of
+Google's drawn in the game); see "Map and navigation" below.
+
 **Community:** join the TGForever Discord, **[discord.gg/tgf](https://discord.gg/tgf)**, and head to the
 #beamng-earth channel to chat about the mod, get help, report bugs, help with its development, and get an IP to join a
 BeamMP.Earth server (see [Multiplayer](#multiplayer-beammp)).
@@ -152,6 +157,17 @@ You can help support development by reporting [issues](https://github.com/TecnaG
   is full or cleared. Tick **Build the world too** (areas and routes up to 155 square miles) to have the roads,
   sidewalks, bridges, buildings and street furniture built ahead as well, so they load at once when you arrive;
   otherwise the world itself is built when you get there.
+- **Google Maps** (this fork): the map's right-click menu has **Open in Google Maps** (the spot in Google Maps in your
+  browser), **Street View here** (Google's Street View nearest the spot) and **Send to phone (QR)** (a QR code of the
+  spot's Google Maps link to scan with your phone's camera, with Open on this PC and Copy link); the GPS box has
+  **Google Maps** (driving directions from your car to the GPS destination, in your browser) and **QR** (the same
+  directions for your phone). The map's search box and the Places panel's Go box take a Google Maps share link from
+  your phone (`maps.app.goo.gl/...` or the older `goo.gl/maps/...`, also with the place's name around it): the app
+  looks up where the short link leads (one request to Google's link shortener, nothing else of Google's) and the map
+  goes to its spot, or searches for the place's name when the link has no coordinates. It uses only Google's
+  [Maps URLs](https://developers.google.com/maps/documentation/urls): no API key, and nothing of Google's is drawn on
+  the in-game map (Google's terms for Europe do not allow mixing Google Maps content with other maps). Links are not
+  sent to the address search while you type.
 - In multiplayer the map has a **Players** list: follow a player, show everyone, or set the GPS to them. Teleport
   works without a car too (the free camera goes there).
 - **Autodrive**: the car drives itself along the GPS route (in lane, legal speed, minding traffic).

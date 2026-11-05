@@ -41,10 +41,15 @@ in a few minutes. No programming needed.
   it on the road. Leave the route and it is planned again. **Clear** stops it, **Teleport** jumps there,
   **Autodrive** lets the car drive the route by itself (in its lane, at the speed limit, minding traffic;
   press it again to drive yourself).
-- **Right-click** the map for **Teleport here**, **Set GPS destination** or **Save this place**.
+- **Right-click** the map for **Teleport here**, **Set GPS destination** or **Save this place**, and (this fork)
+  **Open in Google Maps**, **Street View here** (both open in your browser) or **Send to phone (QR)** (a QR code of
+  the spot's Google Maps link: scan it with your phone's camera). With a GPS route, the GPS box's **Google Maps** and
+  **QR** buttons do the same with driving directions from your car to the destination.
 - The map's **Places** panel (on the right; "Places ›" hides it) lets you save where you are, type
   (or paste from Google Maps) a "latitude, longitude" and press **Go**, go to, rename or delete your
-  saved places, and jump back to recent ones. Click a place's name to see it on the map.
+  saved places, and jump back to recent ones. Click a place's name to see it on the map. The Go box and the search
+  box also take a share link from the Google Maps app on your phone (`maps.app.goo.gl/...`): the world server asks
+  Google's link shortener where it leads (one request; the world server must be running and online).
 - The first visit to a new area takes a little while: the map is downloaded and built while you
   watch. Going back later is much faster (it is cached).
 

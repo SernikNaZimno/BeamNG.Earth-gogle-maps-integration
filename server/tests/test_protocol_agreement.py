@@ -155,6 +155,7 @@ MOD_TO_SERVER = {
                  "photoPx": F(NUM, OPT), "viewM": F(NUM, OPT)},
     "map_tiles": {"tiles": F(list)},       # the world map's basemap tiles as files (settings.mapTiles)
     "geocode": {"id": F(int), "q": F(str), "lat": F(NUM, OPT), "lon": F(NUM, OPT)},   # the map's search box
+    "map_link": {"id": F(int), "url": F(str)},     # a pasted Google Maps short link (maplinks.py; additive)
     # the map's cache view (covermap.py; additive): the zoom-z tiles x0..x1, y0..y1; mode summary / elevation /
     # imagery / mapdata (world: not asked by the map yet)
     "cache_map": {"id": F(int), "z": F(int), "x0": F(NUM), "y0": F(NUM), "x1": F(NUM), "y1": F(NUM),
@@ -195,6 +196,8 @@ SERVER_TO_MOD = {
     "share_info": {"code": F(str), "weight": F(NUM)},     # BeamMP sharing v2: our share code for the poses
     "share_out": {"to": F(str), "d": F(str)},             # ... a message for the plugin ("S") or a player
     "geocode_result": {"id": F(int), "results": F(list), "error": F(str, OPT), "text": F(str, OPT)},   # geocode.py (Photon)
+    # maplinks.py: the long Google Maps link a short one leads to, or the error and the map's message for it
+    "map_link_result": {"id": F(int), "url": F(str, OPT), "error": F(str, OPT), "text": F(str, OPT)},
     # covermap.py: w x h levels (base64, north row first) for the asked box, clipped to the world; gen changes with
     # the index; ready: false while the index is being built
     "cache_map_result": {"id": F(int), "z": F(int), "x0": F(int), "y0": F(int), "w": F(int), "h": F(int),
@@ -370,6 +373,7 @@ EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs
                        "map_tiles_ready",                            # only when the world map asks (map_tiles)
                        "update",                                     # only when GitHub has a newer version (online)
                        "geocode_result", "route_result",             # only when the map / GPS asks
+                       "map_link_result",                            # only when a short link is pasted (online)
                        "cache_map_result",                           # only when the map's cache view asks
                        "area_plan_result", "areas",                  # saved areas: a Server with a Cache (test_areas)
                        "route_download",                             # only when the GPS plans a route (routeahead.py)

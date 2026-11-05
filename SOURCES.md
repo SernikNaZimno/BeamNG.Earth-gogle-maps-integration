@@ -95,6 +95,7 @@ Baden-Wurttemberg (`owsproxy.lgl-bw.de`), Lower Saxony (`opendata.lgln.niedersac
 | Open-Meteo | `api.open-meteo.com` | Real weather (clouds, rain, snow, wind, fog) and the local time zone. | The position you are at. | The weather stays as it is. | optional |
 | Photon (komoot) | `photon.komoot.io` | The map's address and place search. (The status bar's town names no longer come from it: they are read from the Overture Maps data.) | What you type, and your position (to rank nearby results first). | Search says it is unavailable for a moment. | optional |
 | OSRM routing (FOSSGIS) | `routing.openstreetmap.de` | GPS routes over long distances on the map. | The start and the destination of the route. | No new route until it answers. | optional |
+| Google Maps short links | `maps.app.goo.gl`, `goo.gl` | Only when you paste a Google Maps share link (maps.app.goo.gl/...) into the map's search or Go box: the one request reads where the link leads. The long Google Maps link it leads to is not fetched. | The short link you pasted. | The map says it cannot open the link; full Google Maps links and coordinates still work. | optional |
 | EGM2008 gravity model (SourceForge) | `downloads.sourceforge.net` | Real gravity, which differs slightly from place to place (74 MB, downloaded once). | Nothing but the download. | Standard gravity is used. | optional |
 
 ## The app itself

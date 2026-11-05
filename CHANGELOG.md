@@ -2,7 +2,26 @@
 
 What changed in each release of BeamNG.Earth, newest first.
 
-## Unreleased
+## Unreleased (fork: Google Maps integration)
+
+Not in an upstream release: this fork's Google Maps integration, phase 0. It uses only Google's Maps links (no API
+key); nothing of Google's is drawn on the in-game map, and the game and the app never download anything from
+google.com.
+
+### New
+- **Open in Google Maps** and **Street View here** on the world map's right-click menu: the spot in Google Maps, or
+  Google's Street View nearest it, opens in your browser.
+- **Send to phone (QR)** on the same menu: a QR code of the spot's Google Maps link to scan with your phone's camera
+  (or **Open on this PC** / **Copy link**).
+- **Google Maps** and **QR** on the GPS box: driving directions from your car to the GPS destination in Google Maps,
+  in your browser or on your phone.
+- **Paste a Google Maps share link from your phone** into the map's search box or the Places panel's Go box
+  (`maps.app.goo.gl/...`, the older `goo.gl/maps/...`, also with the place's name around it): the map should go to
+  its spot, or search for the place's name when the link has no coordinates. The app asks Google's link shortener
+  where the link leads (one request, nothing else); this needs the app running and online.
+
+### Changed
+- Links typed or pasted into the map's search box are no longer sent to the address search while you type.
 
 ## 1.8.1 beta (2026-11-04)
 

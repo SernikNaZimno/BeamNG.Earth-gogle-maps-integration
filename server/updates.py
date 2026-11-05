@@ -131,16 +131,19 @@ def newest_release(net, fresh=False):
 
 # The mod's update notice asks the server to open the releases page: the game's openWebBrowser does nothing in the
 # native Linux build (the user, 2026-10-18: "i clicked open releases page but it never opened my browser"). Only this
-# project's GitHub pages are opened (a message from the mod cannot open anything else).
+# project's GitHub pages are opened (a message from the mod cannot open anything else). The world map's Google Maps
+# buttons (gmaps.lua) open Google's Maps URLs (https://developers.google.com/maps/documentation/urls: no key) too.
 OPEN_PREFIX = f"https://github.com/{REPO}/"
+OPEN_PREFIXES = (OPEN_PREFIX, "https://www.google.com/maps/search/?api=1&", "https://www.google.com/maps/dir/?api=1&",
+                 "https://www.google.com/maps/@?api=1&")
 
 
 def open_page(url, popen=None):
-    """Open url (this project's GitHub pages only) in the player's browser, without waiting. Returns True if a
-    browser was asked. On Linux xdg-open runs with the packaged app's library and Python paths taken out of its
-    environment (the AppImage's own libraries broke the browser it starts)."""
+    """Open url (this project's GitHub pages and Google's Maps URLs only) in the player's browser, without waiting.
+    Returns True if a browser was asked. On Linux xdg-open runs with the packaged app's library and Python paths taken
+    out of its environment (the AppImage's own libraries broke the browser it starts)."""
     import subprocess
-    if not isinstance(url, str) or not url.startswith(OPEN_PREFIX) or any(c in url for c in ' "\'<>`\\\n\r'):
+    if not isinstance(url, str) or not url.startswith(OPEN_PREFIXES) or any(c in url for c in ' "\'<>`\\\n\r'):
         return False
     popen = popen or subprocess.Popen
     try:

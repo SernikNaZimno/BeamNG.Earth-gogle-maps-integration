@@ -153,6 +153,16 @@ key, fetched straight from the user's own companion, no shared cache, Google
 logo and attribution on screen. It returns 403 for projects billed in the EEA
 since 2025-07-08. Bing Maps is retired for new users. Apple has no usable API.
 
+**Google Maps** (this fork, phase 0; "Google Maps links" below): only Google's
+[Maps URLs](https://developers.google.com/maps/documentation/urls), which need no key and open
+Google Maps itself in the player's browser (or phone, by QR code). Nothing of Google's is drawn on
+the in-game map and neither the game nor the server fetches google.com: the one Google request is
+the companion asking `maps.app.goo.gl` / `goo.gl` where a pasted share link redirects. The reason
+is the Google Maps Platform EEA terms (since 2025-07-08): Google Maps content may not be shown with
+non-Google maps, and Street View and 3D tiles are blocked for EEA projects. Later phases (planned,
+not built): a companion web page with the Google Maps JavaScript API (the user's own key) showing
+the car live on the PC, then the same page on a phone over the LAN, paired by QR code.
+
 ## Roadmap
 0. **Probes** (via MCP `run_lua`): sandbox state, IPC round-trip, `createMesh`
    cost on a 257² grid, `reloadCollision` hitch at 0.5/1/2/5M tris, whether
@@ -776,7 +786,9 @@ over to AWS, a 400 wrote a permanent `.404` marker, and the User-Agent lived in 
 - `places.parseLatLon(text)`: "36.5785, -118.2923" (Google Maps' copy), space-separated, N/S/E/W as
   prefix or suffix (either order: a N/S coordinate is the latitude), degrees-minutes(-seconds) with
   or without °'" (and ′″, no-break spaces); refuses one number, three coordinates, two latitudes,
-  "-36 N", minutes/seconds >= 60, out-of-range values.
+  "-36 N", minutes/seconds >= 60, out-of-range values. A map link is tried first
+  (`places.parseMapLink`: OpenStreetMap's `?mlat=&mlon=` / `#map=z/lat/lon`, Google Maps'
+  `!3d…!4d…`, `?q=` / `?query=` / `?ll=lat,lon` and `/@lat,lon`; "Google Maps links" below).
 - Settings page bridge (settings.lua): `uiPlaces`, `uiPlaceAddHere(name)`, `uiPlaceAdd(name, text)`,
   `uiPlaceRename(id, name)`, `uiPlaceDelete(id)`, `uiPlaceGo(id)`, `uiPlaceGoText(text)`,
   `uiPlaceGoRecent(i, lat, lon)` (the row's lat/lon decide: a Go moves its place to the front, so
@@ -787,6 +799,34 @@ over to AWS, a 400 wrote a permanent `.404` marker, and the User-Agent lived in 
   unreadable file without a copy, non-places JSON, skipped entries, huge ids),
   `test_core_stubbed.lua` (the level start and console teleports recorded). The Vue section is
   checked in-game only.
+
+## Google Maps links (the fork's Google Maps integration, phase 0; branch feature/google-maps-phase0)
+Google Maps Platform's EEA terms (since 2025-07-08) forbid showing Google Maps content together with
+non-Google maps and block Street View and the 3D tiles for EEA projects, so phase 0 uses only Google's
+Maps URLs: no key, nothing of Google's on our map, Google Maps itself opened outside the game.
+- Mod `gmaps.lua` (pure apart from `open`): the links are built from numbers, never from UI text:
+  `placeUrl` (`/maps/search/?api=1&query=lat%2Clon`), `streetViewUrl` (`/maps/@?api=1&map_action=pano&viewpoint=`,
+  optional heading), `directionsUrl` (`/maps/dir/?api=1&origin=&destination=&travelmode=driving`, from the car to
+  the GPS destination). `open` sends the existing `open_page`; the server's allowlist (`updates.OPEN_PREFIXES`)
+  takes these three prefixes besides the project's pages. Without a server the game's `openWebBrowser` is used.
+- The world map: the right-click menu's **Open in Google Maps**, **Street View here** and **Send to phone (QR)**,
+  the GPS box's **Google Maps** and **QR**. The QR dialog (Open on this PC / Copy link / Close) draws the link with
+  our own encoder, `ui-vue/mods/beamngEarth/qrcode.js` (byte mode, versions 1-10, levels L/M/Q/H, the mask with the
+  least penalty), checked module for module against Python's qrcode 8.2 (`mod/tests/test_qrcode.mjs`).
+- Share links: a phone's Google Maps "Share" gives `https://maps.app.goo.gl/<id>` (older: `https://goo.gl/maps/<id>`),
+  which holds no coordinates. The search box and the Places panel's Go box find one in the pasted text
+  (`gmaps.shortLink`) and send `map_link`; the companion (`server/maplinks.py`) GETs the short link through netfetch
+  (the shortener hosts' policy has `redirect_ok`: the 3xx is the answer, its `Location` read, at most 4 hops and only
+  between `maps.app.goo.gl` / `goo.gl`; an EU `consent.google.com?continue=` redirect is read for its `continue`, the
+  long `google.com/maps` link is never fetched) and answers `map_link_result` with the long link or an error and the
+  map's message. The mod reads the point with `places.parseMapLink`; a long link that names a place without
+  coordinates (`?q=Big+Ben&ftid=…`) puts the name (`gmaps.placeName`) into the map's search instead. Links are not
+  sent to Photon while typing. Protocol additive (no bump); server/README.md has the messages and the host policy
+  (0.5/s, burst 3, 1 at once, 200 / 400 a day, optional).
+- Tests: `server/tests/test_maplinks.py`, `mod/tests/test_gmaps.lua`, `mod/tests/test_qrcode.mjs` (in
+  `tools/quality_gate.py`).
+- Later phases (planned, not built): a companion web page with the Google Maps JavaScript API (the user's own key)
+  showing the car live on the PC, then the same page on a phone over the LAN with QR pairing.
 
 ## Download cache: size cap and LRU eviction (`server/cache.py`; docs/ROADMAP.md "Caching" 1, parts of 3 and 5; built offline 2026-10-11, feature/cache-cap)
 Before, every raw download stayed on disk forever (~/.cache/beamng-earth: 2.4 GB, ~43k files after

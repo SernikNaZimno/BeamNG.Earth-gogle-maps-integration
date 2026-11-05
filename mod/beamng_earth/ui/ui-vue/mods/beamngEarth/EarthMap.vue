@@ -213,6 +213,27 @@
       <div class="ctx-item" @click="ctxSave">Save this place</div>
       <div class="ctx-item" @click="ctxCopy">Copy coordinates</div>
       <div v-if="state.gps" class="ctx-item" @click="clearGps">Clear GPS</div>
+      <div class="ctx-sep"></div>
+      <div class="ctx-item" @click="ctxGoogle('place')" title="This point in Google Maps, in your browser">Open in Google Maps</div>
+      <div class="ctx-item" @click="ctxGoogle('streetview')" title="Google's Street View nearest this point, in your browser">Street View here</div>
+      <div class="ctx-item" @click="ctxPhone" title="A QR code of this point's Google Maps link for your phone's camera">Send to phone (QR)</div>
+    </div>
+
+    <!-- a Google Maps link as a QR code for a phone (qrcode.js; gmaps.lua builds the link) -->
+    <div v-if="qr" class="confirm qr-box" @mousedown.stop @wheel.stop>
+      <div class="confirm-title">{{ qr.title }}</div>
+      <div class="confirm-where">Scan it with your phone's camera: it opens in Google Maps.</div>
+      <svg v-if="qr.path" class="qr-svg" :viewBox="`0 0 ${qr.size} ${qr.size}`" shape-rendering="crispEdges">
+        <rect width="100%" height="100%" fill="#fff" />
+        <path :d="qr.path" fill="#000" />
+      </svg>
+      <div v-else class="confirm-warn">The link is too long for a QR code.</div>
+      <div class="qr-url">{{ qr.url }}</div>
+      <div class="confirm-btns">
+        <button class="map-btn" @click="openUrl(qr)">Open on this PC</button>
+        <button class="map-btn" @click="copyText(qr.url)">Copy link</button>
+        <button class="map-btn" @click="qr = null">Close</button>
+      </div>
     </div>
 
     <!-- the GPS destination -->
@@ -234,6 +255,10 @@
         <button v-if="routePts.length >= 2" class="map-btn small" @click="askRoute(routeHalf)"
                 title="Pre-cache this route: its data (elevation, roads, buildings, aerial photos) downloaded and kept, and the world built too if you like">Pre-cache route</button>
         <button class="map-btn small" :disabled="!!state.cannotGo" @click="teleportNow(state.gps.lat, state.gps.lon, state.gps.name)">Teleport</button>
+        <button class="map-btn small" @click="gpsGoogle(false)"
+                title="Directions from where you are to the destination in Google Maps, in your browser">Google Maps</button>
+        <button class="map-btn small" @click="gpsGoogle(true)"
+                title="The same directions as a QR code for your phone">QR</button>
         <button class="map-btn small" :class="{ primary: state.gps.autodrive }" @click="setAutodrive(!state.gps.autodrive)"
                 :title="state.gps.autodrive ? 'Stop driving by itself' : 'The car drives itself along the route (in its lane, at the speed limit)'">
           {{ state.gps.autodrive ? "Autodrive on" : "Autodrive" }}
@@ -405,6 +430,7 @@ import { useEvents } from "@/services/events"
 import { vBngOnUiNav } from "@/common/directives"
 import * as mm from "./mapmath.js"
 import layerData from "./maplayers.js"
+import * as qrc from "./qrcode.js"
 import { BngSelect } from "@/common/components/base"
 
 const props = defineProps({ embedded: { type: Boolean, default: false } })
@@ -1441,8 +1467,18 @@ function showOnMap(p) {
 function wentThere() { follow.value = true; if (!embedded) close() }
 function saveHere() { placesCall(`uiPlaceAddHere(${luaStr(newName.value)})`, "Saved", () => { newName.value = "" }) }
 function goText() {
-  if (!coordText.value.trim()) return
-  placesCall(`uiPlaceGoText(${luaStr(coordText.value)})`, `Going to ${coordText.value.trim()}`, wentThere)
+  const text = coordText.value.trim()
+  if (!text) return
+  // a phone's Google Maps share link holds no coordinates: where it leads first (the server), then the same Go
+  engineLua(`beamngEarth_settings and beamngEarth_settings.uiMapParse(${luaStr(text)}) or nil`, r => {
+    if (!(r && r.shortLink)) { placesCall(`uiPlaceGoText(${luaStr(text)})`, `Going to ${text}`, wentThere); return }
+    placesMsg.value = "Opening the Google Maps link…"
+    placesMsgError.value = false
+    resolveShortLink(r.shortLink, res => {
+      const ll = `${res.lat.toFixed(6)}, ${res.lon.toFixed(6)}`
+      placesCall(`uiPlaceGoText(${luaStr(ll)})`, `Going to ${ll}`, wentThere)
+    }, msg => { placesMsg.value = msg; placesMsgError.value = true })
+  })
 }
 function saveText() {
   if (!coordText.value.trim()) return
@@ -1480,7 +1516,7 @@ function onContext(ev) {
   const p = localXY(ev)
   const v = view.value
   const ll = mm.fromScreen(p.x, p.y, v.lat, v.lon, v.z, w.value, h.value)
-  ctx.value = { x: Math.min(p.x, w.value - 210), y: Math.min(p.y, h.value - 170), lat: ll.lat, lon: ll.lon }
+  ctx.value = { x: Math.min(p.x, w.value - 210), y: Math.min(p.y, h.value - 290), lat: ll.lat, lon: ll.lon }
 }
 function closeCtx() { ctx.value = null }
 // picked from the right-click menu: straight away (a second "Teleport here?" with the same choices was one click too
@@ -1540,6 +1576,72 @@ function ctxGps() {
   const c = ctx.value
   closeCtx()
   setGps(c.lat, c.lon, "")
+}
+
+// ---- Google Maps (gmaps.lua builds the links: Google's Maps URLs, no key) -----------------------------------------
+// kind place / streetview (a, b = lat, lon) or directions (a = "here": from the player; c, d = the destination); then
+// gets { url } (or nothing: BeamNG.Earth not loaded); open: in the player's browser as well
+function googleMaps(kind, a, b, c, d, open, then) {
+  const arg = v => (v === "here" ? luaStr(v) : v == null ? "nil" : luaNum(v))
+  engineLua(`beamngEarth_settings and beamngEarth_settings.uiGoogleMaps(${luaStr(kind)}, ${arg(a)}, ${arg(b)}, ` +
+    `${arg(c)}, ${arg(d)}, ${open ? "true" : "false"}) or nil`, r => {
+    if (!r || !r.url) { showToast((r && r.error) || "BeamNG.Earth is not loaded"); return }
+    if (open) showToast(r.opened ? "Opened in your browser" : "Could not open the browser")
+    if (then) then(r)
+  })
+}
+function ctxGoogle(kind) {
+  if (!ctx.value) return
+  const c = ctx.value
+  closeCtx()
+  googleMaps(kind, c.lat, mm.wrapLon(c.lon), null, null, true)
+}
+// the QR box: { title, url, path, size, kind, a, b, c, d } (the link again for "Open on this PC")
+const qr = ref(null)
+function showQr(title, kind, a, b, c, d) {
+  googleMaps(kind, a, b, c, d, false, r => {
+    const code = qrc.encode(r.url, "M")
+    const border = 4
+    qr.value = { title, url: r.url, kind, a, b, c, d, path: code ? qrc.svgPath(code, border) : "",
+      size: code ? code.size + 2 * border : 0 }
+  })
+}
+function openUrl(q) { googleMaps(q.kind, q.a, q.b, q.c, q.d, true) }
+function ctxPhone() {
+  if (!ctx.value) return
+  const c = ctx.value
+  closeCtx()
+  showQr("Send to phone", "place", c.lat, mm.wrapLon(c.lon), null, null)
+}
+// the GPS box: directions from where the player is to the destination
+function gpsGoogle(phone) {
+  const g = state.value.gps
+  if (!g) return
+  if (phone) showQr("Directions to your phone", "directions", "here", null, g.lat, g.lon)
+  else googleMaps("directions", "here", null, g.lat, g.lon, true)
+}
+
+// A Google Maps share link from a phone (maps.app.goo.gl: no coordinates in it) pasted in the search or Go box: the
+// server reads where it leads (maplinks.py), then done({ lat, lon }); a link to a place with no coordinates puts its
+// name into the search instead
+function resolveShortLink(text, done, fail) {
+  engineLua(`beamngEarth_settings and beamngEarth_settings.uiMapLink(${luaStr(text)}) or nil`, r => {
+    if (!r || r.error || !r.id) { fail((r && r.error) || "BeamNG.Earth is not loaded"); return }
+    let tries = 0
+    const poll = () => {
+      engineLua(`beamngEarth_settings and beamngEarth_settings.uiMapLinkResult(${r.id}) or nil`, res => {
+        if (!res) {
+          if (++tries < 60) setTimeout(poll, 200)
+          else fail("No answer for the Google Maps link")
+          return
+        }
+        if (typeof res.lat === "number") done(res)
+        else if (res.query) query.value = res.query      // (the watch on query searches for it)
+        else fail(res.error || "Cannot open the Google Maps link")
+      })
+    }
+    setTimeout(poll, 200)
+  })
 }
 function setGps(lat, lon, name, then) {
   engineLua(`beamngEarth_settings and beamngEarth_settings.uiMapGps(${luaNum(lat)}, ${luaNum(lon)}, ${luaStr(name || "")}) or nil`, r => {
@@ -1660,6 +1762,7 @@ const searching = ref(false)
 const resultIndex = ref(-1)
 let searchTimer = null, searchSeq = 0
 const LATLON_RE = /^[-+]?\d+(\.\d+)?[°\s]*[NSns]?\s*[,;\s]\s*[-+]?\d+(\.\d+)?/
+const LINK_RE = /https?:\/\/|goo\.gl\//i
 
 function typing(on) { engineLua(`if setCEFTyping then setCEFTyping(${on ? "true" : "false"}) end`) }
 
@@ -1674,7 +1777,8 @@ function liveSearch() {
   const seq = ++searchSeq
   const local = text ? localHits(text) : []
   results.value = local
-  if (text.length < 3 || LATLON_RE.test(text)) { searching.value = false; return }
+  // (a pasted map link is no address: read on Enter, never sent to the address search)
+  if (text.length < 3 || LATLON_RE.test(text) || LINK_RE.test(text)) { searching.value = false; return }
   searching.value = true
   engineLua(`beamngEarth_settings and beamngEarth_settings.uiGeocode(${luaStr(text)}) or nil`, r => {
     if (seq !== searchSeq) return
@@ -1709,10 +1813,17 @@ function moveResult(d) {
 function onSearch() {
   const text = query.value.trim()
   if (!text) { results.value = []; return }
-  if (results.value.length) { pickResult(results.value[Math.max(0, resultIndex.value)]); return }
-  // a typed latitude, longitude (places.lua parses every format the page accepts)
+  if (results.value.length && !LINK_RE.test(text)) { pickResult(results.value[Math.max(0, resultIndex.value)]); return }
+  // a typed latitude, longitude or a map link (places.lua parses every format the page accepts); a phone's Google Maps
+  // share link: where it leads, from the server
   engineLua(`beamngEarth_settings and beamngEarth_settings.uiMapParse(${luaStr(text)}) or nil`, r => {
     if (r && typeof r.lat === "number") goTo(r.lat, r.lon, "")
+    else if (r && r.shortLink) {
+      searching.value = true
+      searchMsg.value = ""
+      resolveShortLink(r.shortLink, res => { searching.value = false; goTo(res.lat, res.lon, "") },
+        msg => { searching.value = false; searchMsg.value = msg })
+    }
     else if (!searching.value) searchMsg.value = "Nothing found (try more of the address, or a latitude, longitude)"
   })
 }
@@ -2051,6 +2162,12 @@ const fmtLatLon = mm.fmtLatLon
 .ctx-item:hover { background: rgba(224, 118, 28, 0.85); }
 .ctx-item.disabled { opacity: 0.45; cursor: default; }
 .ctx-item.disabled:hover { background: none; }
+.ctx-sep { margin: 4px 0; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+/* the Google Maps QR code: black on white (phones' cameras want the dark modules on a light ground) */
+.qr-box { bottom: auto; top: 50%; transform: translate(-50%, -50%); z-index: 12; max-width: 340px; text-align: center; }
+.qr-svg { display: block; width: 240px; height: 240px; margin: 10px auto 6px; border-radius: 4px; }
+.qr-url { font-size: 10px; color: #9aa4ae; word-break: break-all; user-select: text; }
+.qr-box .confirm-btns { justify-content: center; }
 .gps-stack {
   position: absolute; left: 10px; top: 56px; z-index: 6; display: flex; flex-direction: column; gap: 6px;
   align-items: flex-start;

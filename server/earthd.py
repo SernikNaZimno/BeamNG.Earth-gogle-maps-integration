@@ -139,6 +139,7 @@ import imagery as imagerymod  # noqa: E402
 import matslots as matslotsmod  # noqa: E402
 import maptiles as maptilesmod  # noqa: E402
 import geocode as geocodemod  # noqa: E402
+import maplinks as maplinksmod  # noqa: E402
 import routing as routingmod  # noqa: E402
 import updates as updatesmod  # noqa: E402
 import cpupin  # noqa: E402
@@ -4819,6 +4820,19 @@ class Connection:
         log.debug("geocode %r: %d results%s", q, len(out["results"]), (" (" + out["error"] + ")") if "error" in out else "")
         self.send(out)
 
+    async def map_link(self, msg):
+        """A Google Maps short link from the map {"id", "url"} -> map_link_result {"id", "url"} (the long link) or
+        {"id", "error", "text"}."""
+        out = {"type": "map_link_result", "id": msg.get("id")}
+        try:
+            out["url"] = await asyncio.get_running_loop().run_in_executor(
+                self.s.ui_pool, maplinksmod.resolve, str(msg.get("url") or ""), self.s.net)
+        except Exception as e:          # not a short link, offline, expired: the map says which
+            out["error"] = f"{type(e).__name__}: {e}"[:200]
+            out["text"] = maplinksmod.error_text(e)
+            log.info("map link: %s (%s)", out["text"], out["error"])
+        self.send(out)
+
     async def cache_map(self, msg):
         """The map's cache view {"id", "z", "x0", "y0", "x1", "y1", "mode"?} -> cache_map_result {"id", "z", "x0",
         "y0", "w", "h", "cells" (base64, a level per cell), "gen", "ready", "error"?} (covermap.CoverMap.query)."""
@@ -5236,6 +5250,8 @@ class Connection:
             self.spawn(self.map_tiles(msg))
         elif kind == "geocode":                 # the map's search box: addresses and places (geocode.py)
             self.spawn(self.geocode(msg))
+        elif kind == "map_link":                # a pasted Google Maps short link: where it leads (maplinks.py)
+            self.spawn(self.map_link(msg))
         elif kind == "cache_map":               # the map's cache view: what is cached where (covermap.py)
             self.spawn(self.cache_map(msg))
         elif kind == "area_plan":               # the map's picked area: the estimate for its confirm box (areas.py)

@@ -918,11 +918,51 @@ function M.uiAreas()
   return { areas = a and a.areas or {}, pinnedBytes = a and a.pinnedBytes or nil }
 end
 
--- "lat, lon" typed in the map's search box -> { lat, lon } or { error }.
+-- "lat, lon" typed in the map's search box -> { lat, lon } or { error }; a Google Maps short link (a phone's share)
+-- -> { shortLink }: the map asks the server where it leads (uiMapLink) and reads the point from that.
 function M.uiMapParse(text)
   local lat, lon = places.parseLatLon(text)
-  if not lat then return { error = lon } end
+  if not lat then
+    local short = require('beamngEarth/gmaps').shortLink(text)
+    if short then return { shortLink = short } end
+    return { error = lon }
+  end
   return { lat = lat, lon = lon }
+end
+
+-- Google Maps (gmaps.lua): kind 'place' / 'streetview' (lat, lon, heading) or 'directions' (lat0, lon0, lat1, lon1;
+-- 'here' for the start: the player) -> { url, opened } or { error }; open: in the player's browser too (else only the
+-- link, for the map's QR code).
+function M.uiGoogleMaps(kind, a, b, c, d, open)
+  local gmaps = require('beamngEarth/gmaps')
+  if kind == 'directions' and a == 'here' then a, b = places.here() end
+  local url = gmaps.url(kind, a, b, c, d)
+  if not url then return { error = 'no such place' } end
+  return { url = url, opened = open and gmaps.open(url) or false }
+end
+
+-- A Google Maps short link from the search or Go box: send (text -> { id } or { error }) and poll (id -> nil while
+-- waiting, else { lat, lon } or { query } (the link names a place without coordinates: search for it) or { error }).
+local mapLinkId = 0
+function M.uiMapLink(text)
+  local short = require('beamngEarth/gmaps').shortLink(text)
+  if not short then return { error = 'not a Google Maps share link' } end
+  local core = ext('beamngEarth_core')
+  if not core or not core.requestMapLink then return { error = 'BeamNG.Earth is not loaded' } end
+  mapLinkId = mapLinkId + 1
+  if not core.requestMapLink(mapLinkId, short) then return { error = 'Companion server not connected' } end
+  return { id = mapLinkId }
+end
+function M.uiMapLinkResult(id)
+  local core = ext('beamngEarth_core')
+  local r = core and core.takeMapLink and core.takeMapLink(tonumber(id))
+  if not r then return nil end
+  if not r.url then return { error = r.text or r.error or 'Cannot open the Google Maps link' } end
+  local lat, lon = places.parseMapLink(r.url)
+  if lat then return { lat = lat, lon = lon } end
+  local name = require('beamngEarth/gmaps').placeName(r.url)
+  if name then return { query = name } end
+  return { error = 'The Google Maps link has no place in it' }
 end
 
 -- A controller on the map (the user, 2026-10-20: "make sure our map is controller compatible; see how the default map

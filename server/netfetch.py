@@ -126,6 +126,7 @@ class HostPolicy:
     timeout: float = 20.0                   # s per HTTP request
     max_wait: float = 30.0                  # s a demand request may wait for a token
     redirect_limited: bool = False          # a 3xx means "rate limited" (tile hosts never redirect)
+    redirect_ok: bool = False               # a 3xx is the answer (link shorteners: the caller reads its Location)
     binary: bool = False                    # a 200 with an HTML page is an error page
     referer: bool = False                   # send PROJECT_URL as Referer (hosts that ask for one)
     optional: bool = False                  # the world builds without it (gravity, weather, search, routing,
@@ -217,6 +218,11 @@ POLICIES = {
     # ~1 request a second at most, no bulk
     "routing.openstreetmap.de": HostPolicy(rate=0.5, burst=2.0, max_conc=1, daily_budget=300, daily_hard=500,
                                            cache_ttl=DAY, miss_ttl=None, max_wait=10.0, timeout=20.0, max_attempts=1, optional=True),
+    # Google Maps share links (maplinks.py): one request per pasted short link, its redirect is the answer; the long
+    # link it leads to is never fetched
+    **{h: HostPolicy(rate=0.5, burst=3.0, max_conc=1, daily_budget=200, daily_hard=400, cache_ttl=0, miss_ttl=None,
+                     max_wait=5.0, timeout=10.0, max_attempts=1, redirect_ok=True, optional=True)
+       for h in ("maps.app.goo.gl", "goo.gl")},
     # the BeamNG.Earth server list (native/serverlist on the project's mini PC): the tab in BeamMP's server browser,
     # fetched when the player opens it or presses Refresh
     "earth.tgforever.net": HostPolicy(rate=0.2, burst=3.0, max_conc=1, daily_budget=3000, daily_hard=6000,
@@ -311,6 +317,8 @@ ROLES = {
     "downloads.sourceforge.net": "the gravity model; standard gravity meanwhile",
     "photon.komoot.io": "the map's address search",
     "routing.openstreetmap.de": "GPS routes",
+    "maps.app.goo.gl": "Google Maps share links on the map",
+    "goo.gl": "Google Maps share links on the map",
     "earth.tgforever.net": "the BeamNG.Earth server list in BeamMP",
     "raw.githubusercontent.com": "the update check",
     "api.github.com": "one-click updates",
@@ -1077,6 +1085,9 @@ class Fetcher:
             log.warning("net: %s answered %d, Retry-After %.0f s: paused", h.name, status, ra)
             return RateLimited(f"{url}: HTTP {status}, retry after {ra:.0f} s", url, h.name, retry_after=ra,
                                status=status)
+        if 300 <= status < 400 and p.redirect_ok:
+            self._succeeded(h)
+            return Response(status, body, rh, elapsed)
         if 300 <= status < 400 and p.redirect_limited:
             self._failed(h)
             return RateLimited(f"{url}: HTTP {status} redirect (rate limited)", url, h.name, status=status)
