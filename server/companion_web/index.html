@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- the page's own URL holds the token (?t=): never send more than the origin as a referrer (Google's key
+     website restriction only needs the origin) -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="color-scheme" content="dark">
+<title>BeamNG.Earth - Live map</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="bar">
+  <div id="speedBox" class="box" title="Speed">
+    <span id="speed" class="big">-</span>
+    <button id="unitsBtn" class="unit" type="button" title="Switch units">km/h</button>
+  </div>
+  <div id="destBox" class="box">
+    <div id="destName" class="destname">No destination</div>
+    <div id="destInfo" class="destinfo"></div>
+    <div id="routeCredit" class="credit" hidden>Routing: OSRM (FOSSGIS), &copy; OpenStreetMap contributors</div>
+  </div>
+  <div id="searchBox" class="box">
+    <input id="search" type="search" placeholder="Search places" autocomplete="off" spellcheck="false"
+           aria-label="Search places" aria-controls="results">
+    <ul id="results" role="listbox" hidden></ul>
+    <div class="credit">Search: Photon by komoot, &copy; OpenStreetMap contributors</div>
+  </div>
+  <div id="actions" class="box">
+    <button id="followBtn" type="button" class="toggle on" aria-pressed="true" title="Keep the car in the middle">Follow car</button>
+    <button id="centreBtn" type="button" title="Centre the map on the car">Re-centre</button>
+    <button id="autodriveBtn" type="button" class="toggle" aria-pressed="false" disabled>Autodrive off</button>
+    <button id="clearBtn" type="button" disabled>Clear GPS</button>
+  </div>
+</header>
+<div id="status" hidden></div>
+<main id="main">
+  <div id="map"></div>
+  <div id="message" class="card" hidden></div>
+  <div id="keyPanel" class="card" hidden>
+    <div class="cardhead">
+      <strong>Google Maps API key</strong>
+      <button id="keyHide" type="button" class="link" title="Hide this box">Hide</button>
+    </div>
+    <p id="keyLead">Without a key Google shows a dimmed "for development purposes only" map. Paste your own key to get the full map.</p>
+    <ol>
+      <li>In <a href="https://console.cloud.google.com/google/maps-apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud</a>, enable the <b>Maps JavaScript API</b> and create an API key.</li>
+      <li>Restrict the key: API restriction <b>Maps JavaScript API</b>; application restriction <b>Websites</b>: <code id="keySite">http://127.0.0.1:47616/*</code></li>
+      <li>Paste it here.</li>
+    </ol>
+    <form id="keyForm">
+      <input id="keyInput" type="text" placeholder="AIza..." autocomplete="off" spellcheck="false" aria-label="API key">
+      <button type="submit">Save key</button>
+    </form>
+    <div id="keyError" class="error" hidden></div>
+    <p id="keyStored" hidden>A key is stored. <button id="keyRemove" type="button" class="link">Remove the key</button></p>
+  </div>
+  <button id="keyShow" type="button" class="card small" hidden>Google Maps key</button>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

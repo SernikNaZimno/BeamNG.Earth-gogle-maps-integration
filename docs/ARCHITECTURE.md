@@ -159,9 +159,10 @@ Google Maps itself in the player's browser (or phone, by QR code). Nothing of Go
 the in-game map and neither the game nor the server fetches google.com: the one Google request is
 the companion asking `maps.app.goo.gl` / `goo.gl` where a pasted share link redirects. The reason
 is the Google Maps Platform EEA terms (since 2025-07-08): Google Maps content may not be shown with
-non-Google maps, and Street View and 3D tiles are blocked for EEA projects. Later phases (planned,
-not built): a companion web page with the Google Maps JavaScript API (the user's own key) showing
-the car live on the PC, then the same page on a phone over the LAN, paired by QR code.
+non-Google maps, and Street View and 3D tiles are blocked for EEA projects. Phase 1 (built): a
+web page served by the companion with the Google Maps JavaScript API (the user's own key) showing
+the car live on the PC, our own data only (docs/COMPANION.md). Phase 2 (planned): the same page on
+a phone over the LAN, paired by QR code.
 
 ## Roadmap
 0. **Probes** (via MCP `run_lua`): sandbox state, IPC round-trip, `createMesh`
@@ -825,8 +826,11 @@ Maps URLs: no key, nothing of Google's on our map, Google Maps itself opened out
   (0.5/s, burst 3, 1 at once, 200 / 400 a day, optional).
 - Tests: `server/tests/test_maplinks.py`, `mod/tests/test_gmaps.lua`, `mod/tests/test_qrcode.mjs` (in
   `tools/quality_gate.py`).
-- Later phases (planned, not built): a companion web page with the Google Maps JavaScript API (the user's own key)
-  showing the car live on the PC, then the same page on a phone over the LAN with QR pairing.
+- Phase 1, the live map (branch feature/google-maps-phase1): `server/companion.py` serves `server/companion_web/` on
+  127.0.0.1:47616 (token, Host check, SSE for the state and the route, `/api/cmd` -> `remote_cmd` to the game, run by
+  the mod's `remote.lua`); the mod sends `gps_state`. The contract is docs/COMPANION.md. Tests:
+  `server/tests/test_companion.py`, `mod/tests/test_remote.lua`.
+- Phase 2 (planned, not built): the same page on a phone over the LAN with QR pairing.
 
 ## Download cache: size cap and LRU eviction (`server/cache.py`; docs/ROADMAP.md "Caching" 1, parts of 3 and 5; built offline 2026-10-11, feature/cache-cap)
 Before, every raw download stayed on disk forever (~/.cache/beamng-earth: 2.4 GB, ~43k files after

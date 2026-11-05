@@ -813,7 +813,19 @@ function M.uiMapState()
     gps = require('beamngEarth/gps').status(),
     metric = require('beamngEarth/gps').metric(),     -- (the game's length unit with no GPS route: the Players list)
     weather = localWeatherBadge(),
+    -- the live map in the browser's endpoint is on (the server's 'companion' after hello): the Live map button
+    companion = (net.isConnected() and core and core.companionPort and core.companionPort() ~= nil) and true or false,
   }
+end
+
+-- The map's Live map button (docs/COMPANION.md): the server opens its live map page in the player's browser (a second
+-- monitor) -> { ok } or { ok = false, error }.
+function M.uiOpenCompanion()
+  local core = ext('beamngEarth_core')
+  if not core or not core.openCompanion then return { ok = false, error = 'BeamNG.Earth is not loaded' } end
+  if not net.isConnected() then return { ok = false, error = 'Companion server not connected' } end
+  if not core.openCompanion() then return { ok = false, error = 'The live map is off on the server' } end
+  return { ok = true }
 end
 
 -- Teleport from the map (the page asked "Teleport here?" first); recorded in the recent places.

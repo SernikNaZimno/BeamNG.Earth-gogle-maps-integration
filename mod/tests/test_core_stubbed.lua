@@ -821,6 +821,42 @@ T.check(cs.clears == 1 and cs.clearedBytes == 1034567890 and cs.usedBytes == 2e8
 serverSend({ type = 'cache', v = 1, usedBytes = 210000000, capBytes = 0, files = 13, ready = true, managed = true })
 frames(2)
 T.check(core.cacheState().clears == 1 and core.cacheState().clearedBytes == 1034567890, 'later usage keeps the last clear')
+-- the live map in the browser (docs/COMPANION.md): 'companion' turns the Live map button on (settings.uiMapState), its
+-- remote_cmd runs (remote.lua), gps_state follows a change and every hello, open_companion from the button
+do
+  local core = require('beamngEarth/core')
+  local settings = require('beamngEarth/settings')
+  local savedCore = rawget(_G, 'beamngEarth_core')
+  beamngEarth_core = core           -- (the game's extension global: gps.lua / places.lua find core through it)
+  T.check(core.companionPort() == nil and settings.uiMapState().companion == false
+    and settings.uiOpenCompanion().ok == false, 'live map: no companion message yet, no button')
+  serverSend({ type = 'companion', port = 47616 })
+  T.check(pumpUntil(function() return core.companionPort() == 47616 end, 50), 'live map: companion keeps the port')
+  T.check(settings.uiMapState().companion == true, 'live map: the map\'s Live map button shown')
+  local r = settings.uiOpenCompanion()
+  T.check(r.ok == true and #received('open_companion') == 1, 'live map: the button sends open_companion')
+  local n = #received('gps_state')
+  serverSend({ type = 'remote_cmd', action = 'gps', lat = 36.61, lon = -118.16, name = 'Lone Pine' })
+  T.check(pumpUntil(function() return #received('gps_state') > n end, 50), 'live map: gps_state after a remote gps')
+  local g = last('gps_state')
+  T.check(g.active == true and g.lat == 36.61 and g.lon == -118.16 and g.name == 'Lone Pine' and g.autodrive == false,
+    'live map: the remote destination set and shared')
+  serverSend({ type = 'remote_cmd', action = 'teleport', lat = 123, lon = 0 })
+  serverSend({ type = 'remote_cmd', action = 'clear_gps' })
+  T.check(pumpUntil(function() return last('gps_state').active == false end, 50)
+    and require('beamngEarth/gps').status() == nil, 'live map: clear_gps clears and shares active = false')
+  local s2 = last('gps_state')
+  local k = 0
+  for _ in pairs(s2) do k = k + 1 end
+  T.check(k == 2, 'live map: an inactive gps_state has only type and active')
+  -- a new hello: the endpoint off until its own companion, the GPS state sent again
+  n = #received('gps_state')
+  serverSend({ type = 'hello', protocol = 4, format = 4, cells = 64, serverVersion = '0.4.0', sessionId = 's13',
+    farFormat = 'cdae', material = 'bngEarthFar_v3', nearVisual = 'mesh', horizon = true })
+  T.check(pumpUntil(function() return #received('gps_state') > n end, 50) and core.companionPort() == nil
+    and last('gps_state').active == false, 'live map: a new hello sends gps_state and clears the companion port')
+  beamngEarth_core = savedCore
+end
 
 do -- the window gets its view only while it is shown: it is hidden by default (settings hudVisible), and building
    -- one walks every far tile (farfield.stats) each frame

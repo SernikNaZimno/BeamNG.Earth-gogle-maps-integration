@@ -179,6 +179,11 @@ MOD_TO_SERVER = {
     "share_group": {"d": F(str)},
     # the update notice's button: the server opens the releases page (updates.open_page; additive)
     "open_page": {"url": F(str)},
+    # the live map in the browser (companion.py, docs/COMPANION.md; additive): the GPS's destination after every
+    # hello, on a change and every 2 s while active (marks the game's connection), and the world map's Live map button
+    "gps_state": {"active": F(bool), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT),
+                  "autodrive": F(bool, OPT), "remaining": F(NUM, OPT), "eta": F(NUM, OPT)},
+    "open_companion": {},
     "update_now": {},                   # the update notice's "Update now" (selfupdate.py)
     # the level select's "Random location" (randomplace.py; additive)
     "random_place": {"id": F(int)},
@@ -225,6 +230,11 @@ SERVER_TO_MOD = {
     "random_place_result": {"id": F(int), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT)},
     "place_previews_ready": {"keys": F(list)},
     "map_tiles_ready": {"tiles": F(list)},  # [z, x, y, ok, layer] each: written to <user>/temp/beamngEarth/maptiles
+    # the live map in the browser (companion.py; additive): its port after hello when it is on, and a command from
+    # its page to the game's connection
+    "companion": {"port": F(int)},
+    "remote_cmd": {"action": F(str), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT),
+                   "on": F(bool, OPT)},
     "runtime_profiler_pong": {"probe": F(int)},
     "runtime_profiler": {"profile": F(dict)},
     "hello": {"runtimeProfiler": F(int, OPT), "protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
@@ -374,6 +384,8 @@ EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs
                        "update",                                     # only when GitHub has a newer version (online)
                        "geocode_result", "route_result",             # only when the map / GPS asks
                        "map_link_result",                            # only when a short link is pasted (online)
+                       "companion", "remote_cmd",                    # the live map: a Server with a Companion
+                                                                     # (test_companion)
                        "cache_map_result",                           # only when the map's cache view asks
                        "area_plan_result", "areas",                  # saved areas: a Server with a Cache (test_areas)
                        "route_download",                             # only when the GPS plans a route (routeahead.py)

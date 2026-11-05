@@ -21,6 +21,7 @@ python3 server/earthd.py --port 47613 --user-dir ~/.local/share/BeamNG/BeamNG.dr
 | Flag | Default | Meaning |
 |---|---|---|
 | `--port` | `47613` | TCP port on 127.0.0.1 (`0` picks a free port and prints it) |
+| `--companion-port` | `47616` | The live map in the browser (`server/companion.py`, see "Live map in the browser"), on 127.0.0.1; `0` = off. A port in use only logs a warning and leaves it off |
 | `--user-dir` | `~/.local/share/BeamNG/BeamNG.drive/current` | BeamNG user folder. Output goes to `<user-dir>/temp/beamngEarth/<sessionId>/`, which the game sees as `/temp/beamngEarth/<sessionId>/` |
 | `--cache-dir` | `~/.cache/beamng-earth` | Download cache root. DEM tiles: `<cache-dir>/dem/<source>/<z>/<x>/<y>.<ext>`; per-host request counters of each UTC day: `<cache-dir>/netstats/<YYYY-MM-DD>.json`; the layout version `VERSION` and the last-use index `index.tsv` (see "Download cache") |
 | `--cache-cap` | the last cap set on the mod's page, else `20` | Size cap of the download cache in GB (`cache.py`; 0 = unlimited). Over it, a background thread removes the least recently used files down to 90 % (at most every 3 min); never what this session used within the hour, the gravity model or `netstats/`. The mod's settings page can change it (`cache` messages); the server keeps that cap in its index for the next start, and this flag overrides it |
@@ -145,6 +146,8 @@ for descriptor overflow. [Distant traffic](../docs/DISTANT_TRAFFIC.md) maps the 
 | `{"type":"graphics","lodScale":x,"treeScale":x,"buildingScale":x,"photoPx":n,"viewM":m}` | The settings page's graphics (additive; sent after every `hello` and when one changes; every field optional, scales clamped to 0.5-3, `Connection.set_graphics`): `lodScale` times the layout's K (the far field's terrain detail: each level splits that much farther out; the near radii and the exact level under the block are unchanged), selected again at once; `treeScale` times the tree tiles' reach (`vegetation.SEND_M`, drop 256 m beyond); `buildingScale` times the far buildings', skyline's and far bridges' reach; `photoPx` the drawn block's photo size (1024 / 2048 / 4096, `earthd.BASE_SIZES`: the next photos at that size, every layer's AO map the one of that size, built blocks' photos again); `viewM` the fixed view distance (m, at least 10 km; 0 = the real horizon): the far field's radius at most. |
 | `{"type":"cache","capGb":n,"clear":true}` | The download cache (`server/cache.py`; additive like `weather`): both fields optional. `capGb` = the settings page's size cap in GB (0 = unlimited; sent after every `hello` and on change), `clear: true` = "Clear cache" (everything but the files this server session used and the gravity model, on an executor), neither = fresh usage numbers (the page asks every 10 s while it is open). Always answered with a `cache`; ignored by a `Server()` without a `Cache`. |
 | `{"type":"pose","anchorId":A,"x","y","z","vx","vy","lat","lon","speed","cam":{"x","y","z","fx","fy","fz","fovDeg"},"held":[a,…],"sessions":["…"]}` | ~2 Hz. Drives LOD selection, the predicted block and the terrain prefetch. `cam` is optional and only stored for now (the camera-weighted priority is phase 4). A pose with a newer known anchor implies `commit_anchor`; a late pose of the previous anchor is transformed into the active frame. `held` (optional): previous anchors of this session whose tile objects the mod still has (their files stay; the mod sends none while its tiles belong to another server's session). `sessions` (optional): as in `hello`; an adopted folder this connection named before and names no longer is released (deleted through the delete queue) unless another connection still names it. After a server restart the mod sends no pose (and no `prepare_terrain`) until its resync commits: its anchor id is the earlier session's. |
+| `{"type":"gps_state","active":b,"lat":d,"lon":d,"name":"…","autodrive":b,"remaining":m,"eta":s}` | The GPS's destination for the live map in the browser (`server/companion.py`, docs/COMPANION.md; the fork's Google Maps integration, phase 1; additive like `weather`): after every `hello`, whenever the destination, its name or autodrive changes, and every 2 s while active (`remaining` / `eta`). `active: false`: no destination (the other fields left out). Marks the connection as the game's (`Server.companion_conn`: the last one that sent it): the live map's car comes from its poses, its route from its `route`, the page's commands go to it. |
+| `{"type":"open_companion"}` | The world map's **Live map** button: the server opens `http://127.0.0.1:<port>/?t=<token>` in the player's browser (`updates.open_companion`: that URL only, launched as `open_page` launches its pages). Nothing happens with `--companion-port 0`. |
 | `{"type":"map_link","id":N,"url":"…"}` | A Google Maps share link pasted into the map's search box or the Places panel's Go box (`server/maplinks.py`; the fork's Google Maps integration, phase 0; additive like `weather`, no protocol bump): `https://maps.app.goo.gl/<id>` or the older `https://goo.gl/maps/<id>` (`gmaps.shortLink` cuts it out of the pasted text). Resolved on the UI pool (`maplinks.resolve`): one GET per hop to `maps.app.goo.gl` / `goo.gl` only (at most 4 GETs within 20 s, `https` without an explicit port only; a redirect to any other host is refused, never followed), the `Location` of the 3xx is the answer; the long `google.com/maps` link is never fetched, and an EU `consent.google.com/...?continue=` redirect is read for its `continue` parameter. A long Google Maps link comes back as it is. Always answered with a `map_link_result` of the same `id`. Opening a Maps link goes through the existing `open_page`, whose allowlist (`updates.OPEN_PREFIXES`) also takes `https://www.google.com/maps/search/?api=1&`, `/maps/dir/?api=1&` and `/maps/@?api=1&` (built in `gmaps.lua` from numbers). |
 
 ### server → mod
@@ -166,6 +169,8 @@ for descriptor overflow. [Distant traffic](../docs/DISTANT_TRAFFIC.md) maps the 
 | `{"type":"cache","v":1,"usedBytes":n,"capBytes":n,"files":n,"ready":true,"managed":true,"clearedBytes":n}` | The download cache's usage (`server/cache.py`; additive, only with a `Cache`: the command line has one, `Server()` none). After `hello` and in answer to every mod `cache`. `usedBytes` / `files`: what is tracked (`dem/`, `imagery/`, `colormatch/`, `deshadow/`, `mapdata/`, and `gravity/`, which is never removed); `capBytes` 0 = unlimited; `ready` false while the start-up walk is still counting; `managed` false when the cache's `VERSION` is a newer layout (then it is left alone: counted, never evicted or cleared); `clearedBytes` only in the answer to a clear (bytes removed). The settings page shows "1.2 GB of 20 GB, 34877 files". |
 | `{"type":"gravity","v":1,"g":m/s²,"lat","lon","h":m,"source":"egm2008"\|"normal"}` | Real gravity (`server/gravity.py` Provider / Tracker; additive like `weather`). \|g\| at the player's pose (geodetic lat/lon from the pose's anchor frame, `h` = metres above sea level, `msl=True` for EGM2008): computed on the provider's own thread (never the event loop) after the first pose on a known anchor, again when the player moved > 2 km or > 200 m in height from the last value, or when EGM2008 became available; re-sent on `hello`. `source` `"normal"` = WGS84 normal gravity (EGM2008 not on disk yet: a daemon thread downloads it, a failure is retried after 10 min). The mod (`weather.lua`) writes `g − 3.086e-6 × (z − h)` through `core_environment.setGravity` in steps of ≤ 1e-3 m/s² per second; it clears the value on a new `hello`. |
 | `{"type":"weather","v":1,"t":epoch,"lat","lon","code":wmo,"isDay","cover":{"total","low","mid","high"},"baseM","baseAglM","rainMmH","snowCmH","visM","fog","thunder","wind":{"ms","fromDeg","gustMs"},"aloft":{"ms","fromDeg"},"tempC","dewC","elevM","slTempC","pressureHpa","utcOffsetS","tz","credit"}` | Real weather (`server/weather.py`; additive, no protocol bump: both sides ignore unknown types). Open-Meteo's current (15-min) conditions at the 0.1° cell of the player's `pose.lat/lon`, fetched when there is none yet, every 10 min, or after 25 km (one request in flight; a failure keeps the last weather and retries after 2 min, or after the host's Retry-After / open circuit if longer; concurrent requests for one cell share a fetch); cached per (cell, 15-min slot) for all connections; re-sent on `hello`. Rates per hour from the 15-min sums (`× 3600 / interval`); a weather code with a zero sum gets a light floor (drizzle 0.3, rain 1, thunder 4 mm/h; snow 0.5 cm/h). `visM` (null = unknown) is ≤ 800 m with fog codes 45/48. `baseM`/`baseAglM`: the drawn deck's base (= max(low, mid)): a low deck at the LCL (125 m/K × (T − Td)), a mid deck ≥ 3000 m ASL; clamped 200–6000 m above the model ground `elevM`. `slTempC` = `tempC` + 0.0065 × `elevM` (the game lowers it with height). `aloft` = 700 hPa wind (cloud drift). `utcOffsetS`/`tz` = the place's real time zone (`timezone=auto`). `credit` = "Weather data by Open-Meteo.com" (CC BY 4.0), also in `hello.attribution` while weather is on. The mod's mapping is `beamngEarth/weather.lua`. |
+| `{"type":"companion","port":n}` | After `hello` when the live map in the browser is on (`--companion-port`, default 47616; additive): the mod shows the world map's **Live map** button only then. |
+| `{"type":"remote_cmd","action":"gps"\|"clear_gps"\|"teleport"\|"autodrive","lat":d,"lon":d,"name":"…","on":b}` | A command from the live map's page (`POST /api/cmd`, checked by `companion.check_cmd`: `lat`/`lon` for `gps` and `teleport`, `name` optional for `gps`, `on` for `autodrive`), to the game's connection (the last one that sent `gps_state`; none: the page gets a 409). The mod runs it as the world map would (`gps.setDestination`, `gps.clear`, `places.goTo`, `gps.setAutodrive`). |
 | `{"type":"map_link_result","id":N,"url":"…"}` or `{"type":"map_link_result","id":N,"error":"…","text":"…"}` | The answer to `map_link` (additive). `url` = the long Google Maps link the short link leads to; the mod reads the point from it (`places.parseMapLink`: `!3d…!4d…`, `?q=`/`?query=`/`?ll=lat,lon`, `/@lat,lon`) and goes there, or, when it names a place without coordinates (`?q=Big+Ben&ftid=…`, `/maps/place/…`), puts the name in the map's search (`gmaps.placeName`). `error` = the exception (at most 200 characters: not a short link, offline, rate limited, expired, a redirect off the short hosts), `text` = the map's message for it (`maplinks.error_text`). |
 
 Far-field state per connection (`earthd.Connection`): **D** the desired set, **C** the tiles of
@@ -722,6 +727,33 @@ python3 server/airports.py --stats                                   # data-qual
 ```
 (`--cache-dir`, `--offline`, `--refresh`, `--all` for closed and estimated runways, `--px` m per preview pixel.)
 
+## Live map in the browser (`server/companion.py`; docs/COMPANION.md is the contract)
+
+The fork's Google Maps integration, phase 1: a page (`server/companion_web/`) in the player's own browser shows the
+car live on a Google map (the player's Maps JavaScript API key), with the GPS destination and the planned route;
+clicking the map sets the destination or teleports, the page turns Autodrive on and off and searches places (Photon,
+as the world map). `Companion` is a small HTTP endpoint on 127.0.0.1:`--companion-port` (default 47616, the port the
+key's website restriction names), as `maptiles.py`'s (raw asyncio, one request per connection):
+
+- `GET /`, `/index.html`, `/app.js`, `/style.css`: the page's files (no token; 404 for any other name or while the
+  folder is missing);
+- `GET /api/state?t=`: `{"v":1,"connected","player":{"lat","lon","heading","speed","t"},"gps":{"lat","lon","name",
+  "autodrive","remaining","eta"},"routeVersion","apiKey"}` (heading in compass degrees from the pose's `vx`, `vy`
+  while faster than 1 m/s, else the last);
+- `GET /api/events?t=`: server-sent events, `state` at once and on a change (at most 4 a second, changes in between
+  coalesced), `route` (`{"version","points"}`) at once when there is one and on every new one, `: ping` every 15 s;
+  8 streams at most (503);
+- `POST /api/cmd` (`X-BNE-Token`): `gps` / `clear_gps` / `teleport` / `autodrive` -> `remote_cmd` to the game's
+  connection (`Server.companion_cmd`; 409 with none); `POST /api/key`: the key in `<user-dir>/google_maps_key.txt`
+  (`""` deletes it); `GET /api/search?t=&q=`: `geocode.search` biased to the car (`Server.companion_search`, the UI
+  pool).
+
+Every `/api/` request needs the token earthd makes at start (`?t=` on GET, the `X-BNE-Token` header on POST: 403),
+every request a `Host` of `127.0.0.1:<port>` / `localhost:<port>` (421: DNS rebinding); POST bodies 4 KB at most
+(413); `Cache-Control: no-store` always, never a CORS header. earthd feeds it from the game's connection (the last
+one that sent `gps_state`): its poses (`update_pose`), its `gps_state` (`set_gps`), its planned routes (`set_route`),
+and its going (`set_connected(False)`: the destination and route cleared, the car's last position kept).
+
 ## Tests
 
 ```sh
@@ -812,6 +844,12 @@ feature once and every polygon whole, row-group skipping, WorldCover / CHM windo
 shuffled inside the files, from concurrent calls), cache layout and hits, damaged layer files
 rebuilt, invalid keys refused, offline, prefetch refused then demand, predownload, the licences
 (whole) in the provenance and in CREDITS.md, the CLI (dump and PNG).
+`test_companion.py` (the live map in the browser, no network): the heading from the velocity, the Host / token /
+body-size checks, the state's shape, commands checked and forwarded (409 without a game), the key stored and deleted
+in a temporary user folder, the search (biased to the car, its errors), the page's files (content types, 404s),
+real-socket requests and the event stream (its framing, coalescing, pings, the stream cap, clean-up), and earthd's
+glue (gps_state marks the game's connection, poses and routes reach the state, remote_cmd reaches the mod, `companion`
+after hello).
 `test_maplinks.py` (no network: a scripted fake transport): Google Maps short and long links told apart (look-alike
 hosts, bad characters and over-long links refused), one redirect resolved without fetching the long link, a
 `goo.gl/maps` → `maps.app.goo.gl` chain and an EU consent redirect read for its `continue`, loops, redirects off the

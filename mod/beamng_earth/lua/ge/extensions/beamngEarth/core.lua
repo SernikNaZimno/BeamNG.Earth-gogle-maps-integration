@@ -886,7 +886,10 @@ M._netq = { q = {}, head = 1, cost = {}, budgetMs = 4.0, busyMs = 12.0, busyN = 
   -- taken at once brought the road / green / road ground flicker back, the same player)
   urgent = { terrain_ready = true, terrain_ready_set = true, terrain_refresh = true, terrain_error = true,
     block_base = true, terrain_patch = true, ground_ahead = true, status = true, load_progress = true, where_result = true, geocode_result = true,
-    route_result = true, map_link_result = true, random_place_result = true, runtime_profiler_pong = true } }
+    route_result = true, map_link_result = true, random_place_result = true, runtime_profiler_pong = true,
+    -- (the live map in the browser's clicks: a user action, not behind the tiles. Its 'companion' is NOT urgent: it
+    -- follows hello, which clears M._companionPort, and must stay behind it)
+    remote_cmd = true } }
 -- A block's refreshed base photo (block_base) waits while the car is faster than BASE_LATER_MS, and is applied once it
 -- is slower than BASE_NOW_MS, if that block is still the one in use (a later block brings its own photo)
 M.BASE_LATER_MS, M.BASE_NOW_MS = 35, 30         -- m/s (78 / 67 mph; the server skips a block's photo wait over 89 mph)
@@ -935,6 +938,7 @@ local function onMessage(msg)
     trees.clear()
     ambience.clear()
     M._trafficvisuals.session(nil, false)
+    M._companionPort = nil      -- (the live map's endpoint went with its server: no Live map button)
     setStatus('Disconnected from companion server: ' .. tostring(msg.error))
   elseif t == 'runtime_profiler_pong' then
     require('beamngEarth/profiler').pong(msg)
@@ -979,6 +983,10 @@ local function onMessage(msg)
     -- the graphics settings the server serves (terrain detail, tree and building reach, the ground photo's size)
     M.graphicsSent = nil
     M.sendGraphics()
+    -- the live map in the browser (docs/COMPANION.md): its endpoint is off until this server's 'companion' (it follows
+    -- hello when on); the GPS state once now (the server's page knows nothing of a destination set before)
+    M._companionPort = nil
+    gps.share(true)
     -- the on-screen credits: this session's own follow (the attribution line until then)
     credits.clear()
     -- M4: the terrain block first (everything below may use the lattice / follow table); a server without
@@ -1210,6 +1218,13 @@ local function onMessage(msg)
       end
       M._mapLinks[id] = { url = msg.url, error = msg.error, text = msg.text }
     end
+  elseif t == 'remote_cmd' then
+    -- the live map in the browser (docs/COMPANION.md): a click on its page, run as the world map would (remote.lua
+    -- checks it: anything malformed ignored, a teleport that cannot be done now dropped with a log line)
+    require('beamngEarth/remote').run(msg)
+  elseif t == 'companion' then
+    -- ... its endpoint is on (after hello; none when earthd runs with --companion-port 0): the map's Live map button
+    M._companionPort = tonumber(msg.port)
   elseif t == 'areas' then
     -- the saved areas downloaded ahead (server areas.py): the list and progress; result answers an area_add / area_cmd
     M._areas = msg
@@ -2084,6 +2099,7 @@ local function onUpdate(dtReal, dtSim)
   local stg = rawget(_G, 'beamngEarth_settings')
   if stg and stg.redirectBigMap then stg.redirectBigMap(st.inOurLevel) end
   if st.inOurLevel then gps.update(st.anchor, st.player) end
+  gps.share()        -- (the live map in the browser's gps_state: on a change and every 2 s; sent only while connected)
   seasonlook.update(st.inOurLevel, st.anchor and st.anchor.lat)
   t = mark('ui', t)
   local frameMs = frameMs0
@@ -2730,6 +2746,28 @@ function M.takeMapLink(id)
   local r = M._mapLinks[id]
   M._mapLinks[id] = nil
   return r
+end
+
+-- The live map in the browser (docs/COMPANION.md; on M: core.lua is at Lua's 200-locals limit). gps_state: s =
+-- gps.shareState() (gps.share decides when), only while connected and after the server's hello -> whether it was sent.
+function M.sendGpsState(s)
+  if type(s) ~= 'table' or not net.isConnected() or not st.sessionId then return false end
+  if s.active then
+    net.send({ type = 'gps_state', active = true, lat = s.lat, lon = s.lon, name = s.name, autodrive = s.autodrive,
+      remaining = s.remaining, eta = s.eta })
+  else
+    net.send({ type = 'gps_state', active = false })
+  end
+  return true
+end
+-- The endpoint's port while this server's is on (its 'companion' after hello; nil: off, or an older server).
+M._companionPort = nil
+function M.companionPort() return M._companionPort end
+-- The world map's Live map button: the server opens the page in the player's browser (as open_page does).
+function M.openCompanion()
+  if not net.isConnected() or not M._companionPort then return false end
+  net.send({ type = 'open_companion' })
+  return true
 end
 
 -- The world map's cache view (server covermap.py): what is cached in the zoom-z tiles x0..x1, y0..y1 (mode: summary,

@@ -138,6 +138,7 @@ import staging  # noqa: E402
 import imagery as imagerymod  # noqa: E402
 import matslots as matslotsmod  # noqa: E402
 import maptiles as maptilesmod  # noqa: E402
+import companion as companionmod  # noqa: E402
 import geocode as geocodemod  # noqa: E402
 import maplinks as maplinksmod  # noqa: E402
 import routing as routingmod  # noqa: E402
@@ -882,6 +883,10 @@ class Server:
         self.map_port = None                # the in-game map's tile endpoint (maptiles.py), hello.mapPort
         self.map_tiles = None               # its MapTiles: also written as files on request (map_tiles message)
         self.map_files = None               # the maptiles.TileFiles writing them (made by the first request)
+        # the live map in the browser (companion.py, --companion-port; docs/COMPANION.md): its endpoint, and the game's
+        # connection (the last one that sent gps_state): the poses, GPS state and routes it feeds, the commands it runs
+        self.companion = None
+        self.companion_conn = None
         # (anchorId, key) of cached tiles built with the palette because the imagery failed; shown in
         # the status note (re-texturing them once the host is back is a ROADMAP follow-up)
         self.degraded = set()
@@ -1531,6 +1536,26 @@ class Server:
             return navgraphmod.country_near(self.airports_db, float(lat), float(lon))
         except (TypeError, ValueError):
             return None
+
+    def companion_cmd(self, cmd):
+        """A live map command (companion.check_cmd's fields) to the game's connection as remote_cmd; False when no
+        game is connected (the page's 409). On the event loop (the endpoint's handler)."""
+        c = self.companion_conn
+        if c is None or c not in self.connections or c.writer.is_closing():
+            return False
+        c.send(dict(cmd, type="remote_cmd"))
+        log.info("live map: %s", cmd["action"])
+        return True
+
+    def companion_search(self, q, lat, lon):
+        """The live map's search: geocode.search (Photon) biased to (lat, lon), as the world map's (Connection.geocode).
+        Blocking (the endpoint runs it in the UI pool); a failure raises companion.SearchError with the map's text."""
+        try:
+            return geocodemod.search(q, lat, lon, self.net,
+                                     self.country_at(lat, lon) if lat is not None and lon is not None else None)
+        except Exception as e:          # offline, rate limited, refused: the page says which (geocode.error_text)
+            log.info("live map search: %s: %s", type(e).__name__, e)
+            raise companionmod.SearchError(geocodemod.error_text(e)) from e
 
     def left_hand(self, anchor):
         """Whether traffic drives on the left at the anchor (its country's road rules, navgraph.road_rules)."""
@@ -4566,6 +4591,8 @@ class Connection:
                  (" (" + out["error"] + ")") if "error" in out else "")
         self.send(out)
         self.route_points = out["points"] if "error" not in out else []
+        if self.s.companion is not None and self.s.companion_conn is self:     # the live map's route event
+            self.s.companion.set_route(self.route_points)
         mode = msg.get("download")
         self.route_download(version, out["points"], mode if mode in ROUTE_DOWNLOAD_MODES else "ahead")
 
@@ -4994,6 +5021,10 @@ class Connection:
         finally:
             self.route_dl_version += 1          # (a running route_download stops: no one to show its bar to)
             self.s.connections.discard(self)
+            if self.s.companion_conn is self:   # the game went: the live map says so (until a gps_state again)
+                self.s.companion_conn = None
+                if self.s.companion is not None:
+                    self.s.companion.set_connected(False)
             self.s.slots_let_go(list(self.slot_holds))
             self.slot_holds = {}
             for tr in (self.roads, self.signs, self.veg, self.bldfar, self.bldsky, self.brfar, self.nav,
@@ -5193,6 +5224,8 @@ class Connection:
             if self.global_far:
                 m["globalFar"] = farfield.GLOBAL_PROTO
             self.send(m)
+            if self.s.companion is not None:        # the live map is on: the world map shows its button
+                self.send({"type": "companion", "port": self.s.companion.port})
             if self.weather.msg is not None:        # a reconnected mod gets the weather again
                 self.send(self.weather.msg)
             if self.gravity.msg is not None:        # ... and its gravity
@@ -5273,6 +5306,14 @@ class Connection:
         elif kind == "open_page":               # the update notice's button: the releases page (updates.open_page)
             if not updatesmod.open_page(msg.get("url")):
                 log.info("open_page: refused %r", msg.get("url"))
+        elif kind == "gps_state":               # the GPS's destination / autodrive: the live map (companion.py)
+            self.on_gps_state(msg)
+        elif kind == "open_companion":          # the world map's "Live map" button: the page in the player's browser
+            comp = self.s.companion
+            if comp is None:
+                log.info("open_companion: the live map is off (--companion-port 0)")
+            elif not updatesmod.open_companion(comp.url):
+                log.info("open_companion: no browser could be asked")
         elif kind == "terrain_patch":           # ground under another vehicle's collision island (terrainpatch.lua)
             self.spawn(self.terrain_patch(msg))
         elif kind == "cache":
@@ -5877,6 +5918,20 @@ class Connection:
         """Is the far field round the active anchor still being built or sent (far_done not owed yet)?"""
         return bool(self.dirty or self.inflight)
 
+    def on_gps_state(self, msg):
+        """gps_state {"active", "lat"?, "lon"?, "name"?, "autodrive"?, "remaining"?, "eta"?} (docs/COMPANION.md): this
+        connection is the game's from now on (the most recent one that sent it: the live map's car, destination and
+        route come from it, the page's commands go to it), and its destination goes to the page (companion.gps_of)."""
+        comp = self.s.companion
+        new = self.s.companion_conn is not self
+        self.s.companion_conn = self
+        if comp is None:
+            return
+        comp.set_connected(True)
+        comp.set_gps(msg)
+        if new:                                 # (a route it planned before it said so, or none: the page's)
+            comp.set_route(self.route_points)
+
     def on_pose(self, msg):
         self.slots_gone(msg.get("slotsGone"))
         held = msg.get("held")
@@ -5888,6 +5943,9 @@ class Connection:
         self.weather.on_pose(self, msg.get("lat"), msg.get("lon"))
         if isinstance(msg.get("lat"), (int, float)) and isinstance(msg.get("lon"), (int, float)):
             self.pose_ll = (float(msg["lat"]), float(msg["lon"]))     # (the BeamMP share hub's prefetch)
+            if self.s.companion is not None and self.s.companion_conn is self:     # the live map's car
+                self.s.companion.update_pose(msg["lat"], msg["lon"], _num(msg, "vx", 0.0), _num(msg, "vy", 0.0),
+                                             msg.get("speed"))
         if self.s.surface is not None and isinstance(msg.get("lat"), (int, float)) and isinstance(msg.get("lon"), (int, float)):
             self.s.surface.prefetch(float(msg["lat"]), float(msg["lon"]))
         aid = msg.get("anchorId")
@@ -7090,6 +7148,18 @@ async def main_async(args):
             log.info("map tiles on http://127.0.0.1:%d/tiles/{z}/{x}/{y}.jpg", server.map_port)
         except OSError as e:
             log.warning("map tiles off: %s", e)
+    comp_srv = None
+    if getattr(args, "companion_port", 0):
+        # the live map in the browser (companion.py), 127.0.0.1 only; a port in use (a second server, another app)
+        # only loses it: hello then has no "companion" and the mod no Live map button
+        comp = companionmod.Companion(args.user_dir, search=server.companion_search, send_cmd=server.companion_cmd,
+                                      executor=server.ui_pool)
+        try:
+            comp_srv, _ = await comp.start(args.companion_port)
+            server.companion = comp
+            log.info("live map on http://127.0.0.1:%d/ (opened from the world map's Live map button)", comp.port)
+        except OSError as e:
+            log.warning("live map off: port %d: %s", args.companion_port, e)
     srv = await asyncio.start_server(
         lambda r, w: Connection(server, r, w).run(), "127.0.0.1", args.port)
     port = srv.sockets[0].getsockname()[1]
@@ -7119,6 +7189,9 @@ async def main_async(args):
         sweeper.cancel()
         if map_srv is not None:
             map_srv.close()
+        if comp_srv is not None:
+            server.companion.close()
+            comp_srv.close()
         if server.areas is not None:
             server.areas.close()
         net.close()                 # today's request counters
@@ -7473,6 +7546,10 @@ def main():
                          "127.0.0.1; its port goes in hello.mapPort (needs imagery)")
     ap.add_argument("--map-port", type=int, default=0,
                     help="port of the map tile endpoint (default 0: any free port, sent in hello.mapPort)")
+    ap.add_argument("--companion-port", type=int, default=companionmod.DEFAULT_PORT,
+                    help="port of the live map in the browser on 127.0.0.1 (companion.py, docs/COMPANION.md: the "
+                         "world map's Live map button opens it; default %(default)s, the port a Google Maps key's "
+                         "website restriction names; 0 = off)")
     ap.add_argument("--credits", choices=("on", "off"), default="on",
                     help="'credits' messages: the imagery / elevation / weather sources of the tiles within 2 km "
                          "of the player and of the far field, for the mod's on-screen data credits (on change, "

@@ -50,6 +50,8 @@ in a few minutes. No programming needed.
   saved places, and jump back to recent ones. Click a place's name to see it on the map. The Go box and the search
   box also take a share link from the Google Maps app on your phone (`maps.app.goo.gl/...`): the world server asks
   Google's link shortener where it leads (one request; the world server must be running and online).
+  The **Live map** button opens your car on Google Maps in your browser (handy on a second monitor): click the map to
+  set the GPS or teleport. Paste your own Google Maps JavaScript API key on that page for the full map.
 - The first visit to a new area takes a little while: the map is downloaded and built while you
   watch. Going back later is much faster (it is cached).
 

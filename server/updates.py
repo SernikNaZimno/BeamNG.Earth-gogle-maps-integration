@@ -144,14 +144,33 @@ _MAPS_URL = re.compile(r"https://www\.google\.com/maps/(search/|dir/|@)\?api=1&[
 def open_page(url, popen=None):
     """Open url (this project's GitHub pages and Google's Maps URLs only) in the player's browser, without waiting.
     Returns True if a browser was asked. On Linux xdg-open runs with the packaged app's library and Python paths taken
-    out of its environment (the AppImage's own libraries broke the browser it starts)."""
-    import subprocess
+    out of its environment (the AppImage's own libraries broke the browser it starts): launch()."""
     if not isinstance(url, str) or not url.startswith(OPEN_PREFIXES) or any(c in url for c in ' "\'<>`\\\n\r'):
         return False
     if any(ord(c) < 32 or ord(c) == 127 for c in url):
         return False
     if not url.startswith(OPEN_PREFIX) and not _MAPS_URL.fullmatch(url):
         return False
+    return launch(url, popen)
+
+
+# The live map in the browser (companion.py, the mod's open_companion): our own page on 127.0.0.1 with its token, and
+# nothing else (the server builds the URL itself; the message carries none)
+_COMPANION_URL = re.compile(r"http://127\.0\.0\.1:\d{1,5}/\?t=[A-Za-z0-9_-]{8,64}")
+
+
+def open_companion(url, popen=None):
+    """Open the live map's page (http://127.0.0.1:<port>/?t=<token> only) in the player's browser, without waiting;
+    True if a browser was asked."""
+    if not isinstance(url, str) or not _COMPANION_URL.fullmatch(url):
+        return False
+    return launch(url, popen)
+
+
+def launch(url, popen=None):
+    """Ask the player's default browser to open url (checked by the caller), without waiting; True if it was asked.
+    On Linux xdg-open runs with the packaged app's library and Python paths taken out of its environment."""
+    import subprocess
     popen = popen or subprocess.Popen
     try:
         if sys.platform == "win32":

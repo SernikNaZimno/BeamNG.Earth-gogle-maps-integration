@@ -171,6 +171,9 @@
           <div v-if="!otherList.length" class="panel-empty">No other players on the map yet.</div>
         </div>
       </div>
+      <!-- the live map in the browser (docs/COMPANION.md): only while the server's endpoint is on (state.companion) -->
+      <button v-if="state.companion" class="map-btn" @click="openCompanion"
+              title="Your car live on a Google map in your browser (a second monitor)">Live map</button>
       <div class="layers-wrap">
         <button class="map-btn" :class="{ on: layersPanel }" @click="layersPanel = !layersPanel; playersPanel = false" title="Base map and overlays">Layers</button>
         <div v-if="layersPanel" class="layers-panel" @mousedown.stop @wheel.stop @dblclick.stop>
@@ -1617,6 +1620,13 @@ function openUrl(q) {
   engineLua(`beamngEarth_settings and beamngEarth_settings.uiOpenGoogleMaps(${luaStr(q.url)}) or nil`, r => {
     if (!r) { showToast("BeamNG.Earth is not loaded"); return }
     showToast(r.opened ? "Opened in your browser" : "Could not open the browser")
+  })
+}
+// the Live map button: the server opens its live map page (the car on a Google map) in the player's browser
+function openCompanion() {
+  engineLua("beamngEarth_settings and beamngEarth_settings.uiOpenCompanion and beamngEarth_settings.uiOpenCompanion() or nil", r => {
+    if (!r) { showToast("BeamNG.Earth is not loaded"); return }
+    showToast(r.ok ? "Opened in your browser" : (r.error || "Could not open the browser"))
   })
 }
 function ctxPhone() {

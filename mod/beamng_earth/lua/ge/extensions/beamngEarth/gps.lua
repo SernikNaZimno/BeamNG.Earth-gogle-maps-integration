@@ -274,6 +274,46 @@ function M.route()
   return { version = route.version, points = route.points, dist = route.dist, dur = route.dur, elev = route.elev }
 end
 
+-- The live map in the browser (docs/COMPANION.md, the fork's Google Maps phase 1): the destination, its name,
+-- autodrive and the planned route's remaining distance / ETA for the server's page, as gps_state (core.sendGpsState
+-- builds the message, only while connected and after the server's hello). Sent at once when the destination, its name
+-- or autodrive changes (cleared: active = false, once), every SHARE_S while one is set (the remaining / ETA count
+-- down), and after every hello (share(true) from core's hello handler: a restarted server knows nothing). M.share runs
+-- every frame from core's onUpdate (a few comparisons; the remote_cmd that changed something is seen the same frame).
+M.SHARE_S = 2.0
+local shared = nil      -- { lat, lon, name, autodrive } last sent | false (sent inactive) | nil (nothing sent yet)
+local sharedAt = -math.huge
+
+local function finite(x) return type(x) == 'number' and x == x and x > -math.huge and x < math.huge and x or nil end
+
+-- The gps_state fields now: { active = false } or { active = true, lat, lon, name, autodrive, remaining, eta } (name,
+-- remaining (m) and eta (s) nil when there is none / unknown: left out of the message).
+function M.shareState()
+  if not dest then return { active = false } end
+  return { active = true, lat = dest.lat, lon = dest.lon,
+           name = type(dest.name) == 'string' and dest.name ~= '' and dest.name or nil, autodrive = auto,
+           remaining = finite(info and info.remaining), eta = finite(info and info.eta) }
+end
+
+-- force: send now (after a hello). -> whether a gps_state went out.
+function M.share(force)
+  local c = core()
+  if not c or not c.sendGpsState then return false end
+  local now = os.clock()
+  local changed
+  if dest then
+    changed = not shared or shared.lat ~= dest.lat or shared.lon ~= dest.lon or shared.name ~= dest.name
+      or shared.autodrive ~= auto
+  else
+    changed = shared ~= false
+  end
+  if not force and not changed and (not dest or now - sharedAt < M.SHARE_S) then return false end
+  if not c.sendGpsState(M.shareState()) then return false end     -- (not connected: tried again next frame)
+  shared = dest and { lat = dest.lat, lon = dest.lon, name = dest.name, autodrive = auto } or false
+  sharedAt = now
+  return true
+end
+
 local function toEnu(anchor)
   if enu and enu.anchor == anchor then return enu end
   local xs, ys, cum = {}, {}, { 0 }
