@@ -941,6 +941,13 @@ function M.uiGoogleMaps(kind, a, b, c, d, open)
   return { url = url, opened = open and gmaps.open(url) or false }
 end
 
+-- The QR box's "Open on this PC": the link it shows (from uiGoogleMaps), not built again -> { opened }. Only
+-- gmaps' own prefixes (gmaps.open) and the characters its links are made of.
+function M.uiOpenGoogleMaps(url)
+  if type(url) ~= 'string' or url:find('[^%w_%.,%%=&%?/:@%+%-]') then return { opened = false } end
+  return { opened = require('beamngEarth/gmaps').open(url) }
+end
+
 -- A Google Maps short link from the search or Go box: send (text -> { id } or { error }) and poll (id -> nil while
 -- waiting, else { lat, lon } or { query } (the link names a place without coordinates: search for it) or { error }).
 local mapLinkId = 0

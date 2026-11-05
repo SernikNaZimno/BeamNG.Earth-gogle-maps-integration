@@ -40,12 +40,14 @@ def fetcher(answers):
 
 class KindsTest(unittest.TestCase):
     def test_short(self):
-        for u in ("https://maps.app.goo.gl/AbCd123", "http://maps.app.goo.gl/AbCd123?g_st=ic",
+        for u in ("https://maps.app.goo.gl/AbCd123", "https://maps.app.goo.gl/AbCd123?g_st=ic",
                   "https://goo.gl/maps/xyz", " https://maps.app.goo.gl/AbCd123 "):
             self.assertTrue(maplinks.is_short(u), u)
         for u in ("https://maps.app.goo.gl/", "https://goo.gl/xyz", "https://goo.gl/maps/", "ftp://maps.app.goo.gl/x",
                   "https://maps.app.goo.gl.evil.example/x", "https://evil.example/maps.app.goo.gl/x",
-                  'https://maps.app.goo.gl/x"y', None, 5, "https://maps.app.goo.gl/" + "a" * 3000):
+                  'https://maps.app.goo.gl/x"y', None, 5, "https://maps.app.goo.gl/" + "a" * 3000,
+                  "http://maps.app.goo.gl/AbCd123?g_st=ic", "http://goo.gl/maps/xyz", "https://maps.app.goo.gl:443/x",
+                  "https://maps.app.goo.gl:8443/x", "https://goo.gl:99999/maps/x", "https://maps.app.goo.gl:x/y"):
             self.assertFalse(maplinks.is_short(u), u)
 
     def test_long(self):
@@ -54,8 +56,10 @@ class KindsTest(unittest.TestCase):
                   "https://www.google.com.au/maps", "https://www.google.com/maps?q=Big+Ben&ftid=0x1:0x2"):
             self.assertTrue(maplinks.is_long(u), u)
         for u in ("https://www.google.com/search?q=maps", "https://www.google.evil.example/maps/x",
-                  "https://evilgoogle.com/maps/x", "https://www.google.com/mapsx", "https://maps.app.goo.gl/x"):
+                  "https://evilgoogle.com/maps/x", "https://www.google.com/mapsx", "https://maps.app.goo.gl/x",
+                  "https://www.google.com:8080/maps/x", "https://www.google.com:bad/maps/x"):
             self.assertFalse(maplinks.is_long(u), u)
+        self.assertTrue(maplinks.is_long("http://www.google.com/maps/@1,2,3z"), "only read, never fetched")
 
 
 class ResolveTest(unittest.TestCase):
@@ -88,6 +92,50 @@ class ResolveTest(unittest.TestCase):
         with self.assertRaises(netfetch.NotFound):
             maplinks.resolve("https://maps.app.goo.gl/Gone", net)
 
+    def test_hop_limit(self):
+        chain = {f"https://maps.app.goo.gl/H{i}": (302, {"Location": f"https://maps.app.goo.gl/H{i + 1}"}, b"")
+                 for i in range(5)}
+        chain["https://maps.app.goo.gl/H5"] = (302, {"Location": LONG}, b"")
+        net, tr = fetcher(chain)
+        with self.assertRaises(maplinks.LinkError):
+            maplinks.resolve("https://maps.app.goo.gl/H0", net)
+        self.assertEqual(tr.urls, [f"https://maps.app.goo.gl/H{i}" for i in range(maplinks.MAX_HOPS)])
+        # four GETs are enough, a consent link between them not counted
+        consent = "https://consent.google.com/ml?continue=https%3A%2F%2Fmaps.app.goo.gl%2FH2"
+        chain["https://maps.app.goo.gl/H1"] = (302, {"Location": consent}, b"")
+        chain["https://maps.app.goo.gl/H3"] = (302, {"Location": LONG}, b"")
+        net, tr = fetcher(chain)
+        self.assertEqual(maplinks.resolve("https://maps.app.goo.gl/H0", net), LONG)
+        self.assertEqual(len(tr.urls), 4)
+
+    def test_http_and_ports_not_asked(self):
+        net, tr = fetcher({})
+        for u in ("http://maps.app.goo.gl/AbCd123?g_st=ic", "http://goo.gl/maps/xyz", "https://maps.app.goo.gl:443/x",
+                  "https://maps.app.goo.gl:8443/x", "https://maps.app.goo.gl:x/y"):
+            with self.assertRaises(maplinks.LinkError, msg=u):
+                maplinks.resolve(u, net)
+        net, tr2 = fetcher({"https://maps.app.goo.gl/Down": (302, {"Location": "http://maps.app.goo.gl/Plain"}, b"")})
+        with self.assertRaises(maplinks.LinkError):
+            maplinks.resolve("https://maps.app.goo.gl/Down", net)
+        self.assertEqual(tr.urls, [])
+        self.assertEqual(tr2.urls, ["https://maps.app.goo.gl/Down"], "a redirect to http:// is not followed")
+
+    def test_deadline(self):
+        t = Clock()
+
+        class Slow(Transport):
+            def request(self, url, headers, timeout):
+                t.sleep(maplinks.RESOLVE_S / 2 + 1)
+                return super().request(url, headers, timeout)
+
+        tr, nclock = Slow({"https://maps.app.goo.gl/A": (302, {"Location": "https://maps.app.goo.gl/B"}, b""),
+                           "https://maps.app.goo.gl/B": (302, {"Location": "https://maps.app.goo.gl/C"}, b""),
+                           "https://maps.app.goo.gl/C": (302, {"Location": LONG}, b"")}), Clock()
+        net = netfetch.Fetcher(transport=tr, clock=nclock, sleep=nclock.sleep, wall=nclock)
+        with self.assertRaisesRegex(maplinks.LinkError, "too long"):
+            maplinks.resolve("https://maps.app.goo.gl/A", net, clock=t)
+        self.assertEqual(tr.urls, ["https://maps.app.goo.gl/A", "https://maps.app.goo.gl/B"])
+
     def test_messages(self):
         self.assertIn("not found", maplinks.error_text(netfetch.NotFound("x")))
         self.assertIn("offline", maplinks.error_text(netfetch.Offline("x")))
@@ -107,9 +155,15 @@ class OpenPageTest(unittest.TestCase):
         calls = []
         ok = [u for u in ("https://www.google.com/maps/search/?api=1&query=51.178882%2C-1.826215",
                           "https://www.google.com/maps/dir/?api=1&origin=1%2C2&destination=3%2C4&travelmode=driving",
-                          "https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=51.1788%2C-1.8262")]
+                          "https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=51.1788%2C-1.8262&heading=-45")]
         bad = ("https://www.google.com/search?q=x", "https://www.google.com/maps/place/x", "https://www.google.com.evil/maps/",
-               "https://www.google.com/maps/search/?api=1&query=1 2", 'https://www.google.com/maps/@?api=1&x="')
+               "https://www.google.com/maps/search/?api=1&query=1 2", 'https://www.google.com/maps/@?api=1&x="',
+               "https://www.google.com/maps/search/?api=1&query=1\t2", "https://www.google.com/maps/dir/?api=1&origin=1\x002",
+               "https://www.google.com/maps/@?api=1&viewpoint=1\x1b2", "https://www.google.com/maps/@?api=1&x=1\x7f",
+               "https://www.google.com/maps/search/?api=1&query=1#frag", "https://www.google.com/maps/search/?api=1&q=a;b",
+               "https://www.google.com/maps/search/?api=1&query=/x", "https://www.google.com/maps/dir/?api=1&x=\u00e9",
+               "https://www.google.com/maps/search/?api=1&query=1@evil.example",
+               updates.OPEN_PREFIX + "releases\tx", updates.OPEN_PREFIX + "releases\x01")
         if updates.sys.platform == "win32":
             import unittest.mock as mock
             with mock.patch.object(updates.os, "startfile", create=True):

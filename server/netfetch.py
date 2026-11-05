@@ -219,9 +219,9 @@ POLICIES = {
     "routing.openstreetmap.de": HostPolicy(rate=0.5, burst=2.0, max_conc=1, daily_budget=300, daily_hard=500,
                                            cache_ttl=DAY, miss_ttl=None, max_wait=10.0, timeout=20.0, max_attempts=1, optional=True),
     # Google Maps share links (maplinks.py): one request per pasted short link, its redirect is the answer; the long
-    # link it leads to is never fetched
+    # link it leads to is never fetched; short waits, so a hop does not hold one of earthd's 2 ui_pool threads for long
     **{h: HostPolicy(rate=0.5, burst=3.0, max_conc=1, daily_budget=200, daily_hard=400, cache_ttl=0, miss_ttl=None,
-                     max_wait=5.0, timeout=10.0, max_attempts=1, redirect_ok=True, optional=True)
+                     max_wait=3.0, timeout=6.0, max_attempts=1, redirect_ok=True, optional=True)
        for h in ("maps.app.goo.gl", "goo.gl")},
     # the BeamNG.Earth server list (native/serverlist on the project's mini PC): the tab in BeamMP's server browser,
     # fetched when the player opens it or presses Refresh

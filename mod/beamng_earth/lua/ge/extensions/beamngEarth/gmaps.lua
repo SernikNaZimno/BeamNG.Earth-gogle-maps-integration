@@ -3,7 +3,8 @@
 -- share links (maps.app.goo.gl) pasted into the map's search or Go box.
 -- Only Google's Maps URLs (https://developers.google.com/maps/documentation/urls): no API key, no Google request
 -- from the game or the server, nothing of Google's drawn on our map. The links are built here from numbers (the UI
--- passes no URL of its own), and the server opens only these prefixes (updates.open_page). A short link holds no
+-- passes back only the one it was given, for the QR box's "Open on this PC"; M.open takes nothing but these
+-- prefixes), and the server opens only these prefixes (updates.open_page). A short link holds no
 -- coordinates: the server reads where it leads (maplinks.py) and places.parseMapLink reads the point from that.
 -- Pure apart from M.open.
 local M = {}
@@ -53,13 +54,28 @@ function M.url(kind, a, b, c, d)
   return nil
 end
 
--- A Google Maps short link in text (a phone's share: "Stonehenge\nhttps://maps.app.goo.gl/AbC12"), or nil.
-local SHORT = { 'https?://maps%.app%.goo%.gl/[%w_%-]+[%w_%-%?=&%.]*', 'https?://goo%.gl/maps/[%w_%-]+' }
+-- A Google Maps short link in text (a phone's share: "Stonehenge\nhttps://maps.app.goo.gl/AbC12"), or nil; always
+-- normalised: https://, the host in lower case, the id alone (no ?g_st=ic, no full stop after it). The scheme is
+-- optional ("maps.app.goo.gl/AbC12": the map's search takes it as a link too) and the scheme and host any case; the
+-- id is case-sensitive, so it is read from the text itself (ASCII lower keeps the byte positions).
+local SHORT = { { host = 'maps%.app%.goo%.gl/', base = 'https://maps.app.goo.gl/' },
+                { host = 'goo%.gl/maps/', base = 'https://goo.gl/maps/' } }
 function M.shortLink(text)
   if type(text) ~= 'string' or #text > 2048 then return nil end
-  for _, pat in ipairs(SHORT) do
-    local u = text:match(pat)
-    if u then return u end
+  local low = text:lower()
+  for _, s in ipairs(SHORT) do
+    local init = 1
+    while true do
+      local i, j = low:find(s.host, init)
+      if not i then break end
+      local before = i > 1 and low:sub(i - 1, i - 1) or ''
+      local id = text:match('^[%w_%-]+', j + 1)
+      -- the host at the start, after a space or "http(s)://" (not "evilmaps.app.goo.gl/", nor "x.goo.gl/maps/")
+      if id and (before == '' or before == '/' and low:sub(1, i - 1):match('https?://$') or not before:match('[%w%.%-_/]')) then
+        return s.base .. id
+      end
+      init = j + 1
+    end
   end
   return nil
 end

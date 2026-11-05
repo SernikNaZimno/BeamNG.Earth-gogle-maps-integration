@@ -6,18 +6,20 @@ sends the link here (map_link) and gets the long link back (map_link_result); pl
 (parseMapLink) or, when the long link names a place without coordinates (?q=Place+Name&ftid=...), the map searches
 for that name instead.
 
-Only the short-link hosts are ever asked, one GET a hop without following the redirect (netfetch's transport never
-follows), at most MAX_HOPS; the long Google Maps link at the end is not fetched (no request goes to google.com, so no
-consent page and nothing scraped). An EU consent page in the chain (consent.google.com/?continue=<link>) is read for
-its continue link.
+Only the short-link hosts are ever asked (https, no explicit port), one GET a hop without following the redirect
+(netfetch's transport never follows), at most MAX_HOPS GETs within RESOLVE_S; the long Google Maps link at the end is
+not fetched (no request goes to google.com, so no consent page and nothing scraped). An EU consent page in the chain
+(consent.google.com/?continue=<link>) is read for its continue link.
 """
 import re
+import time
 import urllib.parse
 
 import netfetch
 
 SHORT_HOSTS = ("maps.app.goo.gl", "goo.gl")
-MAX_HOPS = 4
+MAX_HOPS = 4            # GETs; consent links and the long link are only read
+RESOLVE_S = 20.0        # the whole chain (earthd's ui_pool has 2 threads; the mod waits ~30 s for the answer)
 MAX_URL = 2048          # Google's own limit for Maps URLs
 # www.google.com, maps.google.com, google.pl, www.google.co.uk, google.com.au ...
 _GOOGLE_HOST = re.compile(r"^(www\.|maps\.)?google\.(com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})$")
@@ -38,10 +40,18 @@ def _split(url):
     return p
 
 
+def _no_port(p):
+    """No explicit port in p (a bad one counts as one). Pure."""
+    try:
+        return p.port is None
+    except ValueError:
+        return False
+
+
 def is_short(url):
-    """A Google Maps short link (maps.app.goo.gl/<id>, goo.gl/maps/<id>). Pure."""
+    """A Google Maps short link (https://maps.app.goo.gl/<id>, https://goo.gl/maps/<id>; no explicit port). Pure."""
     p = _split(url)
-    if p is None or p.hostname not in SHORT_HOSTS:
+    if p is None or p.scheme != "https" or p.hostname not in SHORT_HOSTS or not _no_port(p):
         return False
     path = p.path.strip("/")
     if p.hostname == "goo.gl":
@@ -50,9 +60,10 @@ def is_short(url):
 
 
 def is_long(url):
-    """A full Google Maps link (google.<tld>/maps..., maps.google.<tld>/...). Pure."""
+    """A full Google Maps link (google.<tld>/maps..., maps.google.<tld>/...; http or https, it is only read; no explicit
+    port). Pure."""
     p = _split(url)
-    if p is None or not _GOOGLE_HOST.match(p.hostname or ""):
+    if p is None or not _GOOGLE_HOST.match(p.hostname or "") or not _no_port(p):
         return False
     return p.hostname.startswith("maps.") or p.path == "/maps" or p.path.startswith("/maps/")
 
@@ -66,11 +77,14 @@ def _consent_continue(url):
     return got[0] if got else None
 
 
-def resolve(url, net, max_hops=MAX_HOPS):
-    """The long Google Maps link a short link leads to (a long link comes back as it is). net: a netfetch.Fetcher
-    (the short-link hosts' policy has redirect_ok). Raises LinkError, or netfetch's errors (offline, rate limited)."""
+def resolve(url, net, max_hops=MAX_HOPS, clock=time.monotonic):
+    """The long Google Maps link a short link leads to (a long link comes back as it is), with at most max_hops GETs
+    within RESOLVE_S seconds. net: a netfetch.Fetcher (the short-link hosts' policy has redirect_ok). Raises LinkError,
+    or netfetch's errors (offline, rate limited)."""
     cur = url.strip() if isinstance(url, str) else url
-    for _ in range(max_hops + 1):
+    start, gets = clock(), 0
+    # each GET may lead to one consent link, which is read without a GET
+    for _ in range(2 * max_hops + 2):
         if is_long(cur):
             return cur
         nxt = _consent_continue(cur)
@@ -79,6 +93,11 @@ def resolve(url, net, max_hops=MAX_HOPS):
             continue
         if not is_short(cur):
             raise LinkError("not a Google Maps link")
+        if gets >= max_hops:
+            break
+        if clock() - start >= RESOLVE_S:
+            raise LinkError("the short link took too long")
+        gets += 1
         res = net.get(cur, kind="demand")
         loc = res.headers.get("location") if 300 <= res.status < 400 else None
         if not loc:

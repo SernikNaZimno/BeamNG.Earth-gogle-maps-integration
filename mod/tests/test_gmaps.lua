@@ -27,11 +27,19 @@ T.check(gmaps.url('place', 1, 2) == gmaps.placeUrl(1, 2) and gmaps.url('streetvi
 
 -- the phone's share links
 T.check(gmaps.shortLink('https://maps.app.goo.gl/AbCd12_x-Y') == 'https://maps.app.goo.gl/AbCd12_x-Y', 'short link')
-T.check(gmaps.shortLink('Stonehenge\nhttps://maps.app.goo.gl/AbCd12?g_st=ic') == 'https://maps.app.goo.gl/AbCd12?g_st=ic',
-  'short link inside the shared text')
+T.check(gmaps.shortLink('Stonehenge\nhttps://maps.app.goo.gl/AbCd12?g_st=ic') == 'https://maps.app.goo.gl/AbCd12',
+  'short link inside the shared text, its query dropped')
 T.check(gmaps.shortLink('https://goo.gl/maps/Xyz123') == 'https://goo.gl/maps/Xyz123', 'old goo.gl/maps link')
-for _, bad in ipairs({ 'https://goo.gl/Xyz', 'https://maps.app.goo.gl/', '51.1, -1.8', 'https://www.google.com/maps/@1,2,3z', 5 }) do
-  T.check(gmaps.shortLink(bad) == nil, 'not a short link: ' .. tostring(bad))
+T.check(gmaps.shortLink('see https://maps.app.goo.gl/AbC12.') == 'https://maps.app.goo.gl/AbC12', 'short link: no full stop')
+T.check(gmaps.shortLink('(https://goo.gl/maps/Xyz123), ok') == 'https://goo.gl/maps/Xyz123', 'short link: no punctuation')
+T.check(gmaps.shortLink('HTTPS://MAPS.APP.GOO.GL/AbC') == 'https://maps.app.goo.gl/AbC', 'short link: any case, the id kept')
+T.check(gmaps.shortLink('Http://Goo.gl/Maps/aBc') == 'https://goo.gl/maps/aBc', 'old link: any case, https')
+T.check(gmaps.shortLink('maps.app.goo.gl/xyz') == 'https://maps.app.goo.gl/xyz', 'short link: no scheme')
+T.check(gmaps.shortLink('Big Ben goo.gl/maps/Q1') == 'https://goo.gl/maps/Q1', 'old link: no scheme')
+for _, bad in ipairs({ 'https://goo.gl/Xyz', 'https://maps.app.goo.gl/', 'https://maps.app.goo.gl/?x=1', '51.1, -1.8',
+    'https://www.google.com/maps/@1,2,3z', 'https://evilmaps.app.goo.gl/x', 'https://x.goo.gl/maps/y',
+    'https://maps.app.goo.gl/' .. string.rep('a', 2048), 5 }) do
+  T.check(gmaps.shortLink(bad) == nil, 'not a short link: ' .. tostring(bad):sub(1, 60))
 end
 T.check(gmaps.placeName('https://www.google.com/maps?q=Big+Ben,+London&ftid=0x1:0x2') == 'Big Ben, London', 'name: ?q=')
 T.check(gmaps.placeName('https://www.google.com/maps/place/Krak%C3%B3w/data=!4m2') == 'Kraków', 'name: /maps/place/')
@@ -58,6 +66,16 @@ beamngEarth_core = { _state = function() return { player = { lat = 50.06, lon = 
 r = settings.uiGoogleMaps('directions', 'here', nil, 52.23, 21.01, false)
 T.check(r.url == gmaps.directionsUrl(50.06, 19.94, 52.23, 21.01), 'uiGoogleMaps: directions from the player')
 T.check(settings.uiGoogleMaps('evil', 1, 2).error, 'uiGoogleMaps: unknown kind')
+-- the QR box's "Open on this PC": the link it shows, opened as it is; only Google's Maps URLs, only their characters
+local n0 = #sent
+r = settings.uiOpenGoogleMaps(gmaps.directionsUrl(50.06, 19.94, 52.23, 21.01))
+T.check(r.opened and #sent == n0 + 1 and sent[#sent].type == 'open_page' and
+  sent[#sent].url == gmaps.directionsUrl(50.06, 19.94, 52.23, 21.01), 'uiOpenGoogleMaps: the link sent as open_page')
+for _, bad in ipairs({ 'https://evil.example/', 'https://www.google.com/maps/place/x', gmaps.placeUrl(1, 2) .. '"x',
+    gmaps.placeUrl(1, 2) .. ' x', gmaps.placeUrl(1, 2) .. '#x', gmaps.placeUrl(1, 2) .. '\n', 5 }) do
+  T.check(settings.uiOpenGoogleMaps(bad).opened == false, 'uiOpenGoogleMaps: refused ' .. tostring(bad))
+end
+T.check(#sent == n0 + 1, 'uiOpenGoogleMaps: nothing else sent')
 
 T.check(settings.uiMapParse('see https://maps.app.goo.gl/AbC').shortLink == 'https://maps.app.goo.gl/AbC',
   'uiMapParse: a short link to resolve')
@@ -83,6 +101,16 @@ T.check(settings.uiMapLinkResult(b.id).query == 'Big Ben', 'uiMapLinkResult: a n
 local c = settings.uiMapLink('https://maps.app.goo.gl/Gone')
 core._mapLinks[c.id] = { error = 'NotFound: x', text = 'Google Maps link not found (expired or mistyped?)' }
 T.check(settings.uiMapLinkResult(c.id).error:match('not found'), 'uiMapLinkResult: the server\'s message')
+-- the answers as they come (map_link_result): kept until taken, but not those 8 ids older than the newest
+net.update = function() return { { type = 'map_link_result', id = 3, url = 'https://www.google.com/maps?q=A' },
+  { type = 'map_link_result', id = 11, url = 'https://www.google.com/maps?q=B' } } end
+core.onUpdate(0.016, 0.016)
+T.check(core._mapLinks[3] and core._mapLinks[11], 'map_link_result: kept')
+net.update = function() return { { type = 'map_link_result', id = 12, error = 'Timeout' } } end
+core.onUpdate(0.016, 0.016)
+T.check(core._mapLinks[3] == nil and core._mapLinks[11] and core._mapLinks[12].error == 'Timeout',
+  'map_link_result: an answer nobody took dropped')
+net.update = function() return {} end
 net.isConnected = function() return false end
 T.check(settings.uiMapLink('https://maps.app.goo.gl/Q').error == 'Companion server not connected', 'uiMapLink: offline')
 

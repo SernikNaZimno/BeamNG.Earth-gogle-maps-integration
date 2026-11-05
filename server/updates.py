@@ -136,6 +136,9 @@ def newest_release(net, fresh=False):
 OPEN_PREFIX = f"https://github.com/{REPO}/"
 OPEN_PREFIXES = (OPEN_PREFIX, "https://www.google.com/maps/search/?api=1&", "https://www.google.com/maps/dir/?api=1&",
                  "https://www.google.com/maps/@?api=1&")
+# a Maps URL as a whole: gmaps.lua builds them only from numbers (query=LAT%2CLON, origin=, destination=,
+# travelmode=driving, map_action=pano, viewpoint=, heading=)
+_MAPS_URL = re.compile(r"https://www\.google\.com/maps/(search/|dir/|@)\?api=1&[A-Za-z0-9_.,%=&+-]*")
 
 
 def open_page(url, popen=None):
@@ -144,6 +147,10 @@ def open_page(url, popen=None):
     out of its environment (the AppImage's own libraries broke the browser it starts)."""
     import subprocess
     if not isinstance(url, str) or not url.startswith(OPEN_PREFIXES) or any(c in url for c in ' "\'<>`\\\n\r'):
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        return False
+    if not url.startswith(OPEN_PREFIX) and not _MAPS_URL.fullmatch(url):
         return False
     popen = popen or subprocess.Popen
     try:

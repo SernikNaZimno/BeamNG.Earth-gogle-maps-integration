@@ -1202,7 +1202,14 @@ local function onMessage(msg)
     if msg.id then geocodeResults[msg.id] = { results = msg.results or {}, error = msg.error, text = msg.text } end
   elseif t == 'map_link_result' then
     -- a pasted Google Maps short link: the long link it leads to (server maplinks.py), or why not
-    if msg.id then M._mapLinks[msg.id] = { url = msg.url, error = msg.error, text = msg.text } end
+    -- (answers nobody took, the map closed or a newer link asked: dropped once 8 ids old)
+    local id = tonumber(msg.id)
+    if id then
+      for k in pairs(M._mapLinks) do
+        if type(k) ~= 'number' or k < id - 8 then M._mapLinks[k] = nil end
+      end
+      M._mapLinks[id] = { url = msg.url, error = msg.error, text = msg.text }
+    end
   elseif t == 'areas' then
     -- the saved areas downloaded ahead (server areas.py): the list and progress; result answers an area_add / area_cmd
     M._areas = msg
