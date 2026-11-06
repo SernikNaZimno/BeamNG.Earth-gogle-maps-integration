@@ -51,7 +51,8 @@ in a few minutes. No programming needed.
   box also take a share link from the Google Maps app on your phone (`maps.app.goo.gl/...`): the world server asks
   Google's link shortener where it leads (one request; the world server must be running and online).
   The **Live map** button opens your car on Google Maps in your browser (handy on a second monitor): click the map to
-  set the GPS or teleport. Paste your own Google Maps JavaScript API key on that page for the full map.
+  set the GPS or teleport. Paste your own Google Maps JavaScript API key on that page for the full map. **Phone**
+  shows a QR code: scan it with your phone (same Wi-Fi) to have the live map on the phone.
 - The first visit to a new area takes a little while: the map is downloaded and built while you
   watch. Going back later is much faster (it is cached).
 

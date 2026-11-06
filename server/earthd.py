@@ -1547,6 +1547,21 @@ class Server:
         log.info("live map: %s", cmd["action"])
         return True
 
+    def companion_lan_state(self):
+        """companion_lan_state {"on", "url", "phones", "error"}: the phone sharing (companion.lan_info, docs/COMPANION.md
+        "Phone over the local network")."""
+        info = self.companion.lan_info()
+        return {"type": "companion_lan_state", "on": info["on"], "url": info["url"], "phones": info["phones"],
+                "error": info["error"]}
+
+    def companion_lan_push(self):
+        """The phone sharing turned on or off, a new code, or a phone came or went (Companion.on_lan_change): its state
+        to the game's connection (none: nobody to tell; the dialog asks when it opens). On the event loop."""
+        c = self.companion_conn
+        if self.companion is None or c is None or c not in self.connections:
+            return
+        c.send(self.companion_lan_state())
+
     def companion_search(self, q, lat, lon):
         """The live map's search: geocode.search (Photon) biased to (lat, lon), as the world map's (Connection.geocode).
         Blocking (the endpoint runs it in the UI pool); a failure raises companion.SearchError with the map's text."""
@@ -5314,6 +5329,8 @@ class Connection:
                 log.info("open_companion: the live map is off (--companion-port 0)")
             elif not updatesmod.open_companion(comp.url):
                 log.info("open_companion: no browser could be asked")
+        elif kind == "companion_lan":           # the world map's Phone dialog: the phone sharing on / off / a new code
+            self.spawn(self.companion_lan(msg))
         elif kind == "terrain_patch":           # ground under another vehicle's collision island (terrainpatch.lua)
             self.spawn(self.terrain_patch(msg))
         elif kind == "cache":
@@ -5931,6 +5948,25 @@ class Connection:
         comp.set_gps(msg)
         if new:                                 # (a route it planned before it said so, or none: the page's)
             comp.set_route(self.route_points)
+
+    async def companion_lan(self, msg):
+        """companion_lan {"on", "renew"?} (docs/COMPANION.md "Phone over the local network"): the phone sharing on
+        (renew: a new code, every phone disconnected) or off -> companion_lan_state to the asker (error set and on
+        false when it could not be turned on: no LAN address, the port taken)."""
+        comp = self.s.companion
+        on = msg.get("on")
+        if not isinstance(on, bool):
+            log.warning("client %s: companion_lan: on must be true or false", self.peer)
+            return
+        if comp is None:
+            self.send({"type": "companion_lan_state", "on": False, "url": None, "phones": 0,
+                       "error": "the live map is off (--companion-port 0)"})
+            return
+        if on and msg.get("renew") is True:
+            await comp.renew_lan()
+        else:
+            await comp.set_lan(on)
+        self.send(self.s.companion_lan_state())
 
     def on_pose(self, msg):
         self.slots_gone(msg.get("slotsGone"))
@@ -7153,7 +7189,8 @@ async def main_async(args):
         # the live map in the browser (companion.py), 127.0.0.1 only; a port in use (a second server, another app)
         # only loses it: hello then has no "companion" and the mod no Live map button
         comp = companionmod.Companion(args.user_dir, search=server.companion_search, send_cmd=server.companion_cmd,
-                                      executor=server.ui_pool)
+                                      executor=server.ui_pool, lan_ip=getattr(args, "companion_lan_ip", None),
+                                      on_lan_change=server.companion_lan_push)
         try:
             comp_srv, _ = await comp.start(args.companion_port)
             server.companion = comp
@@ -7190,7 +7227,7 @@ async def main_async(args):
         if map_srv is not None:
             map_srv.close()
         if comp_srv is not None:
-            server.companion.close()
+            server.companion.close()        # (the phone sharing too: never remembered across starts)
             comp_srv.close()
         if server.areas is not None:
             server.areas.close()
@@ -7550,6 +7587,10 @@ def main():
                     help="port of the live map in the browser on 127.0.0.1 (companion.py, docs/COMPANION.md: the "
                          "world map's Live map button opens it; default %(default)s, the port a Google Maps key's "
                          "website restriction names; 0 = off)")
+    ap.add_argument("--companion-lan-ip", default=None, metavar="A",
+                    help="the PC's address a phone opens the live map on once the player turns the phone sharing "
+                         "on (docs/COMPANION.md \"Phone over the local network\"; default: the address of the "
+                         "interface with the default route); a private IPv4 address only")
     ap.add_argument("--credits", choices=("on", "off"), default="on",
                     help="'credits' messages: the imagery / elevation / weather sources of the tiles within 2 km "
                          "of the player and of the far field, for the mod's on-screen data credits (on change, "

@@ -828,6 +828,47 @@ function M.uiOpenCompanion()
   return { ok = true }
 end
 
+-- The phone URL the server sent (docs/COMPANION.md, phase 2), before the map shows it as a QR code and a link: only
+-- http://<private IPv4>:<port>/?t=<token> (10/8, 172.16/12, 192.168/16) -> the url, or nil.
+function M.lanUrl(url)
+  if type(url) ~= 'string' or #url > 160 then return nil end
+  local a, b, c, d, port = url:match('^http://(%d+)%.(%d+)%.(%d+)%.(%d+):(%d+)/%?t=[A-Za-z0-9_%-]+$')
+  if not a then return nil end
+  for _, s in ipairs({ a, b, c, d, port }) do
+    if #s > 1 and s:sub(1, 1) == '0' then return nil end     -- (no leading zeros: 010 is octal to some parsers)
+  end
+  a, b, c, d, port = tonumber(a), tonumber(b), tonumber(c), tonumber(d), tonumber(port)
+  if b > 255 or c > 255 or d > 255 or port < 1 or port > 65535 then return nil end
+  if a == 10 or (a == 172 and b >= 16 and b <= 31) or (a == 192 and b == 168) then return url end
+  return nil
+end
+
+-- The map's Phone button: the live map shared with phones on the local network. on (renew: a new code, every phone
+-- disconnected) or off -> { ok } or { ok = false, error }; on while already on with a link is not asked again (the
+-- state follows every change). Then uiCompanionLanState, polled.
+function M.uiCompanionLan(on, renew)
+  local core = ext('beamngEarth_core')
+  if not core or not core.companionLan then return { ok = false, error = 'BeamNG.Earth is not loaded' } end
+  if not net.isConnected() then return { ok = false, error = 'Companion server not connected' } end
+  local s = core.companionLanState and core.companionLanState()
+  if on and not renew and s and s.on and M.lanUrl(s.url) then return { ok = true } end
+  if not core.companionLan(on, renew) then return { ok = false, error = 'The live map is off on the server' } end
+  return { ok = true }
+end
+-- -> { pending = true } until the server's answer, else { on, url (checked: nil when not a local network link),
+-- phones, error }
+function M.uiCompanionLanState()
+  local core = ext('beamngEarth_core')
+  if not core or not core.companionLanState then return { on = false, phones = 0, error = 'BeamNG.Earth is not loaded' } end
+  if not net.isConnected() then return { on = false, phones = 0, error = 'Companion server not connected' } end
+  local s = core.companionLanState()
+  if not s then return { pending = true } end
+  local url = s.on and M.lanUrl(s.url) or nil
+  local err = s.error
+  if s.on and not url then err = 'The server sent no local network link' end
+  return { on = s.on and url ~= nil, url = url, phones = s.phones or 0, error = err }
+end
+
 -- Teleport from the map (the page asked "Teleport here?" first); recorded in the recent places.
 function M.uiMapTeleport(lat, lon, name)
   local ok, why = places.goTo(lat, lon, name)

@@ -588,4 +588,20 @@ files[settings.FILE] = { version = 1, groundCover = false, rocks = false, trees 
 local v3 = settings.load()
 T.check(v3.quality == 'custom' or v3.quality == 'low', 'old knobs that match no preset stay theirs')
 files[settings.FILE] = nil
+
+-- the live map's phone link (docs/COMPANION.md, phase 2): only http://<private IPv4>:<port>/?t=<token> is shown
+for _, u in ipairs({ 'http://192.168.1.23:47616/?t=abc_DEF-123', 'http://10.0.0.5:47616/?t=x', 'http://172.16.0.1:1/?t=a',
+    'http://172.31.255.254:65535/?t=Zz9-_' }) do
+  T.check(settings.lanUrl(u) == u, 'phone link accepted: ' .. u)
+end
+for _, u in ipairs({ 'http://8.8.8.8:47616/?t=abc', 'http://127.0.0.1:47616/?t=abc', 'http://172.15.0.1:47616/?t=abc',
+    'http://172.32.0.1:47616/?t=abc', 'http://192.169.1.2:47616/?t=abc', 'http://11.0.0.1:47616/?t=abc',
+    'https://192.168.1.23:47616/?t=abc', 'http://192.168.1.23/?t=abc', 'http://192.168.1.23:47616/?t=',
+    'http://192.168.1.23:47616/?t=abc&x=1', 'http://192.168.1.23:47616/x?t=abc', 'http://192.168.1.256:47616/?t=abc',
+    'http://192.168.01.23:47616/?t=abc', 'http://192.168.1.23:0/?t=abc', 'http://192.168.1.23:65536/?t=abc',
+    'http://192.168.1.23:47616/?t=a b', 'http://192.168.1.23:47616/?t=abc\n', 'javascript:alert(1)//192.168.1.2',
+    'http://192.168.1.23:47616/?t=' .. string.rep('a', 200), '' }) do
+  T.check(settings.lanUrl(u) == nil, 'phone link refused: ' .. u)
+end
+T.check(settings.lanUrl(nil) == nil and settings.lanUrl(5) == nil, 'phone link: not a string refused')
 T.done('test_settings')

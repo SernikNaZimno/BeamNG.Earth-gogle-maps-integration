@@ -1,4 +1,4 @@
-// BeamNG.Earth live map (phase 1 of the Google Maps integration; contract: docs/COMPANION.md).
+// BeamNG.Earth live map (phases 1 and 2 of the Google Maps integration; contract: docs/COMPANION.md).
 // Plain JS, no build step. The only external script is Google's Maps JavaScript API, loaded with the player's own key.
 // Everything that comes from the server or from Google is inserted as text (textContent), never as HTML.
 (function () {
@@ -6,20 +6,30 @@
 
   const $ = (id) => document.getElementById(id);
   const TOKEN = new URLSearchParams(location.search).get("t") || "";
+  // phase 2: the same files on a phone over the local network (any address but the PC's own loopback names)
+  const PHONE = ["127.0.0.1", "localhost", "[::1]"].indexOf(location.hostname) < 0;
+  const SITE = "http://" + location.host + "/*";     // what the key's website restriction must allow for this page
   const KEY_RE = /^[A-Za-z0-9_-]{20,80}$/;
   const UNITS_KEY = "bne.liveMap.units";
   const RETRY_MS = 3000;
+  const BUSY_MS = 61000;          // after a 429 (the server blocks a peer for 60 s)
+  const LAN_POLL_MS = 5000;       // the phone box asks /api/lan this often (a new code made in the game shows too)
   const JUMP_M = 2000;            // a move farther than this between two states is a teleport: no animation
   const FIRST_ZOOM = 16;
-  const MSG_EXPIRED = "This link is no longer valid (the world server was restarted?). Open the Live map again from the game (world map > Live map).";
+  const MSG_EXPIRED = PHONE
+    ? "This link has expired: scan the new QR code on the PC"
+    : "This link is no longer valid (the world server was restarted?). Open the Live map again from the game (world map > Live map).";
   const MSG_NO_GAME = "The game is not connected";
-  const MSG_NO_SERVER = "World server not reachable";
+  // (a phone cannot tell a lost Wi-Fi from sharing stopped on the PC: nothing answers either way)
+  const MSG_NO_SERVER = PHONE ? "The PC is not reachable (same Wi-Fi? sharing still on?)" : "World server not reachable";
+  const MSG_BUSY = "Too many requests: wait a minute";
 
   // ------------------------------------------------------------------------------------------ state
   let units = loadUnits();        // "metric" | "imperial"
   let state = null;               // the last state JSON
   let streamUp = false;           // the event stream is open
   let triedStream = false;
+  let unreachable = false;        // the last check of /api/state got no answer at all
   let expired = false;
   let keyStored = "";
 
@@ -105,7 +115,11 @@
     const s = $("status");
     let text = "", cls = "";
     if (expired) { text = "Link expired"; cls = "bad"; }
-    else if (triedStream && !streamUp) { text = MSG_NO_SERVER; cls = "bad"; }
+    else if (triedStream && !streamUp) {
+      // the stream dropped (a phone slept, the Wi-Fi changed, earthd restarted): openStream / recheck are on it
+      if (!unreachable) { text = "Reconnecting…"; cls = "warn"; }
+      else { text = PHONE ? "Reconnecting… " + MSG_NO_SERVER : MSG_NO_SERVER; cls = "bad"; }
+    }
     else if (state && !state.connected) { text = "Game not connected"; cls = "warn"; }
     s.textContent = text;
     s.className = cls;
@@ -143,6 +157,7 @@
     let data = null;
     try { data = await r.json(); } catch (e) { /* not JSON */ }
     if (r.status === 409) return { ok: false, error: MSG_NO_GAME };
+    if (r.status === 429) return { ok: false, error: MSG_BUSY };
     if (r.status === 403) { linkExpired(); return { ok: false, error: MSG_EXPIRED }; }
     if (!r.ok || !data || data.ok === false) {
       return { ok: false, error: data && data.error ? capital(data.error) : "Error " + r.status };
@@ -150,8 +165,12 @@
     return { ok: true, data: data };
   }
 
+  // the token is no longer accepted (earthd restarted; on a phone: a new code or sharing stopped): no more retries,
+  // a phone would only run into the server's 429 for wrong tokens
   function linkExpired() {
     expired = true;
+    stopStream();
+    if (!PHONE) closeLanBox();
     showMessage(MSG_EXPIRED, true);
     setStatus();
   }
@@ -183,7 +202,7 @@
     } else {
       $("destName").textContent = "No destination";
       $("destName").title = "";
-      info.textContent = "Click the map or search to set one";
+      info.textContent = (PHONE ? "Tap" : "Click") + " the map or search to set one";
     }
 
     const ad = $("autodriveBtn");
@@ -215,6 +234,7 @@
     setStatus();
     onPlayer(s.player);
     renderDest();
+    if (!PHONE) renderLanState();
   }
 
   function renderDest() {
@@ -478,6 +498,7 @@
     if (seq !== searchSeq) return;               // an older answer
     if (r.status === 0) { resultNote(MSG_NO_SERVER); return; }
     if (r.status === 403) { linkExpired(); resultNote("Link expired"); return; }
+    if (r.status === 429) { resultNote(MSG_BUSY); return; }
     const d = r.data || {};
     const list = Array.isArray(d.results) ? d.results.filter((x) => x && num(x.lat) && num(x.lon)) : [];
     if (!list.length) {
@@ -543,7 +564,17 @@
   // ------------------------------------------------------------------------------------------ key panel
   function setupKeyPanel(key) {
     keyStored = key;
-    $("keySite").textContent = location.origin + "/*";
+    document.querySelectorAll(".keysite").forEach((c) => { c.textContent = SITE; });
+    if (PHONE) {
+      // the key is set on the PC (POST /api/key answers 403 here): no form, only what the phone's address needs
+      $("keySteps").hidden = $("keyForm").hidden = $("keyStored").hidden = true;
+      $("keyPhone").hidden = false;
+      $("keyLead").textContent = key
+        ? "The Google Maps key comes from the PC (it is set and changed on the PC's Live map page)."
+        : "No Google Maps key is set, so Google shows a dimmed “for development purposes only” map. The key is set on the PC: paste it on the PC's Live map page.";
+      showKeyPanel(!key);
+      return;
+    }
     $("keyStored").hidden = !key;
     $("keyLead").textContent = key
       ? "Paste a new key to replace the stored one."
@@ -601,8 +632,9 @@
       carMarker = destMarker = searchMarker = infoWin = null;
       routeLine = routeCasing = null;
       mapFailed("Google did not accept the API key. In Google Cloud check that the key may use the Maps JavaScript API, " +
-        "that billing is enabled, and that its website restriction allows " + location.origin + "/* . " +
-        "Replace or remove the key below.");
+        "that billing is enabled, and that its website restriction allows " + SITE + (PHONE
+        ? " (this phone's address, besides the PC's). The key itself is replaced or removed on the PC."
+        : " . Replace or remove the key below."));
       showKeyPanel(true);
     };
     window.__bneMapsReady = function () {
@@ -665,44 +697,259 @@
   }
 
   // ------------------------------------------------------------------------------------------ the stream
-  let es = null;
+  let es = null;                  // the EventSource (null until the first state arrived)
+  let streamSeq = 0;              // bumped by every open / stop: late events and checks of an older stream are dropped
+  let retryTimer = 0;
   function openStream() {
+    clearTimeout(retryTimer);
+    retryTimer = 0;
+    if (expired) return;
     if (es) es.close();
-    es = new EventSource(apiUrl("/api/events"));
+    const seq = ++streamSeq;
+    const s = es = new EventSource(apiUrl("/api/events"));
     triedStream = true;
-    es.onopen = () => { streamUp = true; setStatus(); };
-    es.addEventListener("state", (e) => {
+    s.onopen = () => {
+      if (seq !== streamSeq) return;
       streamUp = true;
-      let s = null;
-      try { s = JSON.parse(e.data); } catch (err) { return; }
-      applyState(s);
+      unreachable = false;
+      clearTimeout(retryTimer);
+      retryTimer = 0;
+      setStatus();
+    };
+    s.addEventListener("state", (e) => {
+      if (seq !== streamSeq) return;
+      streamUp = true;
+      let st = null;
+      try { st = JSON.parse(e.data); } catch (err) { return; }
+      applyState(st);
     });
-    es.addEventListener("route", (e) => {
+    s.addEventListener("route", (e) => {
+      if (seq !== streamSeq) return;
       let r = null;
       try { r = JSON.parse(e.data); } catch (err) { return; }
       onRoute(r);
     });
-    es.onerror = () => {
+    s.onerror = () => {
+      if (seq !== streamSeq) return;
       streamUp = false;
       setStatus();
-      // a network error: the browser reconnects by itself (readyState CONNECTING). An HTTP error (403 after an
-      // earthd restart, 503 with too many pages open) closes the stream for good: find out why and reopen.
-      if (es.readyState === EventSource.CLOSED) {
-        es.close();
-        setTimeout(recheck, RETRY_MS);
-      }
+      // A network error: the browser reconnects by itself (readyState CONNECTING). An HTTP error (403 when the link
+      // expired, 503 with too many pages open) closes the stream for good. EventSource sees no status codes, so
+      // /api/state is asked either way: it tells an expired link (403) from a PC out of reach (no answer).
+      if (s.readyState === EventSource.CLOSED) s.close();
+      if (!retryTimer) retryLater(RETRY_MS);
     };
   }
 
-  async function recheck() {
+  function stopStream() {
+    streamSeq++;
+    clearTimeout(retryTimer);
+    retryTimer = 0;
+    if (es) es.close();
+    streamUp = false;
+  }
+
+  function retryLater(ms) {
+    clearTimeout(retryTimer);
+    const seq = streamSeq;
+    retryTimer = setTimeout(() => recheck(seq), ms);
+  }
+
+  async function recheck(seq) {
+    retryTimer = 0;
     const r = await getJSON("/api/state");
+    if (seq !== streamSeq || expired || streamUp) return;     // reopened meanwhile, given up, or back by itself
+    unreachable = r.status === 0;
     if (r.status === 403) { linkExpired(); return; }
     if (r.status === 200 && r.data) { applyState(r.data); openStream(); return; }
     setStatus();
-    setTimeout(recheck, r.status === 503 ? 2 * RETRY_MS : RETRY_MS);
+    retryLater(r.status === 429 ? BUSY_MS : r.status === 503 ? 2 * RETRY_MS : RETRY_MS);
+  }
+
+  // A phone sleeps, changes Wi-Fi, freezes the tab: the stream is let go while hidden (the PC's count of phones stays
+  // true and none of the server's 8 streams is held by a pocket) and reopened at once when the page is seen again,
+  // without waiting for the browser's own retry.
+  function wireLifecycle() {
+    document.addEventListener("visibilitychange", () => {
+      if (!es || expired) return;
+      if (document.visibilityState === "hidden") { if (PHONE) stopStream(); return; }
+      if (PHONE || !streamUp) openStream();
+    });
+    window.addEventListener("online", () => { if (es && !expired) openStream(); });
+    window.addEventListener("pageshow", (e) => { if (e.persisted && es && !expired) openStream(); });
+  }
+
+  // ------------------------------------------------------------------------------------------ the phone box (PC only)
+  // The Phone button: sharing over the local network turned on (POST /api/lan) and the phone URL as a QR code.
+  // Close only hides the box (the phones keep their map); Stop sharing turns it off; New code = off and on again.
+  let lan = null;                 // the last /api/lan answer: {on, url, ip, phones, error}
+  let lanBusy = "";               // the text shown while a POST /api/lan runs
+  let lanFetching = false;
+  let lanTimer = 0;
+  let qrUrl = "";                 // the URL the QR code was drawn for
+  let qrLib = null;               // the import("./qrcode.js") promise
+
+  function lanOpen() { return !$("lanBox").hidden; }
+
+  function phonesText(n) {
+    n = num(n) ? n : 0;
+    return n === 0 ? "No phone connected yet" : n === 1 ? "1 phone connected" : n + " phones connected";
+  }
+
+  // state.lan ({on, phones}, live): the button, the box's count, and a change made elsewhere (the game's Phone dialog)
+  function renderLanState() {
+    const s = state && state.lan;
+    const on = !!(s && s.on);
+    const b = $("phoneBtn");
+    b.classList.toggle("on", on);
+    b.textContent = on && num(s.phones) && s.phones > 0 ? "Phone · " + s.phones : "Phone";
+    b.title = on ? "Sharing to phones is on: show the QR code" : "Open this map on your phone (a QR code)";
+    if (!lanOpen()) return;
+    renderLanInfo();
+    if (s && lan && !lanBusy && on !== !!lan.on) refreshLan();
+  }
+
+  function renderLanInfo() {
+    const s = state && state.lan;
+    let text = lanBusy;
+    if (!text && lan && lan.on) text = phonesText(s && num(s.phones) ? s.phones : lan.phones);
+    else if (!text && lan && !lan.error) text = "Sharing is off";
+    $("lanInfo").textContent = text;
+  }
+
+  function lanError(text) {
+    const e = $("lanError");
+    e.textContent = text || "";
+    e.hidden = !text;
+  }
+
+  function renderLan(d) {
+    lan = d && typeof d === "object" ? d : null;
+    const on = !!(lan && lan.on && typeof lan.url === "string" && lan.url);
+    lanError(on || !lan || !lan.error ? "" : "Could not share to phones: " + capital(lan.error));
+    $("lanUrl").textContent = on ? lan.url : "";
+    $("lanUrl").hidden = !on;
+    if (!on) { qrUrl = ""; $("lanQr").textContent = ""; $("lanQr").hidden = true; }
+    else if (lan.url !== qrUrl) drawQr(lan.url);
+    $("lanRenew").textContent = on ? "New code" : "Turn on";
+    $("lanRenew").disabled = false;
+    $("lanStop").disabled = !on;
+    // the phone's address differs from the PC's: the key's website restriction must allow it too
+    let site = "";
+    if (on) { try { site = "http://" + new URL(lan.url).host + "/*"; } catch (e) { /* not a URL: no hint */ } }
+    $("lanSite").textContent = site;
+    $("lanKeyHint").hidden = !site;
+    renderLanInfo();
+  }
+
+  async function drawQr(url) {
+    qrUrl = url;
+    let lib = null;
+    try {
+      if (!qrLib) qrLib = import("./qrcode.js");      // the mod's encoder, served by the server as an ES module
+      lib = await qrLib;
+    } catch (e) {
+      console.warn("qrcode.js", e);
+      qrLib = null;
+    }
+    if (qrUrl !== url) return;                          // a newer code meanwhile
+    const box = $("lanQr");
+    box.textContent = "";
+    box.hidden = false;
+    const code = lib ? lib.encode(url, "M") : null;
+    if (!code) {
+      if (!lib) qrUrl = "";                             // drawn again on the next answer
+      box.append(el("div", "error", lib
+        ? "The address is too long for a QR code: type it into the phone's browser."
+        : "The QR code could not be drawn: type the address below into the phone's browser."));
+      return;
+    }
+    const border = 4;                                   // the quiet zone, in modules (the standard's 4)
+    const n = code.size + 2 * border;
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 " + n + " " + n);
+    svg.setAttribute("shape-rendering", "crispEdges");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "QR code of the phone link");
+    const bg = document.createElementNS(ns, "rect");
+    bg.setAttribute("width", String(n));
+    bg.setAttribute("height", String(n));
+    bg.setAttribute("fill", "#ffffff");
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", lib.svgPath(code, border));
+    path.setAttribute("fill", "#000000");
+    svg.append(bg, path);
+    box.append(svg);
+  }
+
+  // -> the answer, or null (the error is shown)
+  async function lanPost(body, busyText) {
+    lanBusy = busyText;
+    $("lanRenew").disabled = $("lanStop").disabled = true;
+    lanError("");
+    renderLanInfo();
+    const r = await post("/api/lan", body);
+    lanBusy = "";
+    if (!r.ok) {
+      $("lanRenew").disabled = false;
+      $("lanStop").disabled = !(lan && lan.on);
+      lanError(r.error);
+      renderLanInfo();
+      return null;
+    }
+    renderLan(r.data);
+    return r.data;
+  }
+
+  async function refreshLan() {
+    if (lanFetching || lanBusy || expired) return;
+    lanFetching = true;
+    const r = await getJSON("/api/lan");
+    lanFetching = false;
+    if (r.status === 403) { linkExpired(); return; }
+    if (r.status === 200 && r.data && lanOpen() && !lanBusy) renderLan(r.data);
+  }
+
+  function openLanBox() {
+    $("lanBox").hidden = false;
+    $("lanClose").focus();
+    clearInterval(lanTimer);
+    lanTimer = setInterval(refreshLan, LAN_POLL_MS);
+    lanPost({ on: true }, "Turning on…");             // idempotent while on
+  }
+
+  function closeLanBox() {
+    $("lanBox").hidden = true;
+    clearInterval(lanTimer);
+    lanTimer = 0;
+  }
+
+  function wireLanBox() {
+    $("phoneBtn").hidden = false;
+    $("phoneBtn").addEventListener("click", () => { if (lanOpen()) closeLanBox(); else openLanBox(); });
+    $("lanClose").addEventListener("click", closeLanBox);
+    $("lanRenew").addEventListener("click", async () => {
+      const wasOn = !!(lan && lan.on);
+      const d = await lanPost(wasOn ? { renew: true } : { on: true }, wasOn ? "Making a new code…" : "Turning on…");
+      if (d && d.on && wasOn) toast("New code: the old one no longer works");
+    });
+    $("lanStop").addEventListener("click", async () => {
+      const d = await lanPost({ on: false }, "Stopping…");
+      if (d && !d.on) { closeLanBox(); toast("Sharing to phones stopped"); }
+    });
   }
 
   // ------------------------------------------------------------------------------------------ start
+  // a phone: the touch layout (style.css, html.phone) and the buttons below the map
+  function setupPhone() {
+    document.documentElement.classList.add("phone");
+    // no page zoom: a pinch that starts on the bar would zoom the page, not the map (which zooms itself, greedy)
+    const vp = document.querySelector('meta[name="viewport"]');
+    if (vp) vp.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover");
+    $("main").after($("actions"));
+  }
+
   function wireButtons() {
     $("unitsBtn").addEventListener("click", () => {
       units = units === "imperial" ? "metric" : "imperial";
@@ -720,7 +967,11 @@
       if (!g) return;
       cmd({ action: "autodrive", on: !g.autodrive }, g.autodrive ? "Autodrive off" : "Autodrive on", [e.currentTarget]);
     });
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (!PHONE && lanOpen()) { closeLanBox(); return; }      // the box first, the click menu with the next one
+      closeMenu();
+    });
   }
 
   async function firstState() {
@@ -728,25 +979,30 @@
       const r = await getJSON("/api/state");
       if (r.status === 403) { linkExpired(); return null; }
       if (r.status === 200 && r.data) return r.data;
-      triedStream = true;          // shows "World server not reachable"
+      triedStream = true;          // shows "Reconnecting…" / "World server not reachable"
+      unreachable = r.status === 0;
       setStatus();
-      await new Promise((res) => setTimeout(res, RETRY_MS));
+      await new Promise((res) => setTimeout(res, r.status === 429 ? BUSY_MS : RETRY_MS));
     }
   }
 
   async function start() {
+    if (PHONE) setupPhone();
     renderBar();
     if (!TOKEN) {
-      showMessage("Open this page from the game (world map > Live map)");
+      showMessage(PHONE ? "Scan the QR code on the PC (world map > Phone) to open this page" : "Open this page from the game (world map > Live map)");
       document.querySelectorAll("button, input").forEach((b) => { b.disabled = true; });
       return;
     }
     wireButtons();
     wireSearch();
     wireKeyPanel();
+    if (!PHONE) wireLanBox();
+    wireLifecycle();
     const s = await firstState();
     if (!s) return;
     triedStream = false;
+    unreachable = false;
     applyState(s);
     setupKeyPanel(typeof s.apiKey === "string" ? s.apiKey : "");
     loadGoogle(KEY_RE.test(s.apiKey || "") ? s.apiKey : "");

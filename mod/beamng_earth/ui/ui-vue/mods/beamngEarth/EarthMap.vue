@@ -174,6 +174,8 @@
       <!-- the live map in the browser (docs/COMPANION.md): only while the server's endpoint is on (state.companion) -->
       <button v-if="state.companion" class="map-btn" @click="openCompanion"
               title="Your car live on a Google map in your browser (a second monitor)">Live map</button>
+      <button v-if="state.companion" class="map-btn" @click="phoneLan(false)"
+              title="The live map on your phone over the local network (a QR code to scan)">Phone</button>
       <div class="layers-wrap">
         <button class="map-btn" :class="{ on: layersPanel }" @click="layersPanel = !layersPanel; playersPanel = false" title="Base map and overlays">Layers</button>
         <div v-if="layersPanel" class="layers-panel" @mousedown.stop @wheel.stop @dblclick.stop>
@@ -222,19 +224,37 @@
       <div class="ctx-item" @click="ctxPhone" title="A QR code of this point's Google Maps link for your phone's camera">Send to phone (QR)</div>
     </div>
 
-    <!-- a Google Maps link as a QR code for a phone (qrcode.js; gmaps.lua builds the link) -->
+    <!-- a Google Maps link as a QR code for a phone (qrcode.js; gmaps.lua builds the link); qr.phone: the live map's
+         link for a phone on the local network instead (the Phone button: phoneLan) -->
     <div v-if="qr" class="confirm qr-box" @mousedown.stop @wheel.stop>
       <div class="confirm-title">{{ qr.title }}</div>
-      <div class="confirm-where">Scan it with your phone's camera: it opens in Google Maps.</div>
+      <div v-if="!qr.phone" class="confirm-where">Scan it with your phone's camera: it opens in Google Maps.</div>
+      <div v-else-if="qr.url" class="confirm-where">Scan it with your phone's camera: the live map opens in its browser.</div>
       <svg v-if="qr.path" class="qr-svg" :viewBox="`0 0 ${qr.size} ${qr.size}`" shape-rendering="crispEdges">
         <rect width="100%" height="100%" fill="#fff" />
         <path :d="qr.path" fill="#000" />
       </svg>
-      <div v-else class="confirm-warn">The link is too long for a QR code.</div>
-      <div class="qr-url">{{ qr.url }}</div>
+      <div v-else-if="qr.url" class="confirm-warn">The link is too long for a QR code.</div>
+      <div v-if="qr.url" class="qr-url">{{ qr.url }}</div>
+      <template v-if="qr.phone">
+        <div v-if="qr.url" class="confirm-where">{{ qr.phones === 1 ? "1 phone connected" : `${qr.phones} phones connected` }}</div>
+        <div v-if="qr.waiting" class="confirm-where">Turning on sharing with phones...</div>
+        <div v-if="qr.error" class="confirm-warn">{{ qr.error }}</div>
+        <div v-else-if="qr.off" class="confirm-warn">Sharing with phones is off (New code turns it on again).</div>
+        <div class="qr-hints">
+          <div>The phone must be on the same Wi-Fi / network as this PC.</div>
+          <div>Windows may ask to allow the app through the firewall the first time: allow it on private networks (a
+            network set to Public blocks phones).</div>
+          <div>The link is plain HTTP on your own network: use it at home, not on public Wi-Fi.</div>
+        </div>
+      </template>
       <div class="confirm-btns">
-        <button class="map-btn" @click="openUrl(qr)">Open on this PC</button>
-        <button class="map-btn" @click="copyText(qr.url)">Copy link</button>
+        <button v-if="!qr.phone" class="map-btn" @click="openUrl(qr)">Open on this PC</button>
+        <button v-if="qr.url" class="map-btn" @click="copyText(qr.url)">Copy link</button>
+        <template v-if="qr.phone">
+          <button class="map-btn" :disabled="qr.waiting" @click="phoneLan(true)">New code</button>
+          <button class="map-btn" @click="stopPhone">Stop sharing</button>
+        </template>
         <button class="map-btn" @click="qr = null">Close</button>
       </div>
     </div>
@@ -1606,14 +1626,16 @@ function ctxGoogle(kind) {
   closeCtx()
   googleMaps(kind, c.lat, mm.wrapLon(c.lon), null, null, true)
 }
-// the QR box: { title, url, path, size }
+// the QR box: { title, url, path, size } (phone: the live map's phone link, phoneLan below)
 const qr = ref(null)
+// a link's QR code: { path, size } (path "": too long for one)
+function qrCode(url) {
+  const code = qrc.encode(url, "M")
+  const border = 4
+  return { path: code ? qrc.svgPath(code, border) : "", size: code ? code.size + 2 * border : 0 }
+}
 function showQr(title, kind, a, b, c, d) {
-  googleMaps(kind, a, b, c, d, false, r => {
-    const code = qrc.encode(r.url, "M")
-    const border = 4
-    qr.value = { title, url: r.url, path: code ? qrc.svgPath(code, border) : "", size: code ? code.size + 2 * border : 0 }
-  })
+  googleMaps(kind, a, b, c, d, false, r => { qr.value = { title, url: r.url, ...qrCode(r.url) } })
 }
 // "Open on this PC": the very link the QR shows (built again, a directions' "here" would be where the car is now)
 function openUrl(q) {
@@ -1629,6 +1651,57 @@ function openCompanion() {
     showToast(r.ok ? "Opened in your browser" : (r.error || "Could not open the browser"))
   })
 }
+// The Phone button (docs/COMPANION.md, phase 2): the live map on a phone over the local network. Sharing is turned on
+// (renew: a new code, every phone disconnected), then the server's answer polled every second while the box is open:
+// the phone link as a QR code (settings.lua checked it is a local network one), the phones connected, or why it could
+// not be turned on (no answer in 10 s: said so). Close (Esc, the pad's back) keeps sharing on; Stop sharing ends it
+const PHONE_POLL_MS = 1000, PHONE_WAIT_MS = 10000
+let phoneSeq = 0, phoneTimer = null
+function phoneLan(renew) {
+  const seq = ++phoneSeq
+  clearTimeout(phoneTimer)
+  qr.value = { phone: true, title: "Live map on your phone", url: "", path: "", size: 0, phones: 0, error: "", off: false,
+    waiting: true }
+  engineLua("beamngEarth_settings and beamngEarth_settings.uiCompanionLan and " +
+    `beamngEarth_settings.uiCompanionLan(true, ${renew ? "true" : "false"}) or nil`, r => {
+    if (seq !== phoneSeq || !qr.value || !qr.value.phone) return
+    if (!r || !r.ok) { qr.value = { ...qr.value, waiting: false, error: (r && r.error) || "BeamNG.Earth is not loaded" }; return }
+    const askedAt = Date.now()
+    const poll = () => {
+      engineLua("beamngEarth_settings and beamngEarth_settings.uiCompanionLanState and " +
+        "beamngEarth_settings.uiCompanionLanState() or nil", s => {
+        const q = qr.value
+        if (seq !== phoneSeq || !q || !q.phone) return
+        phoneTimer = setTimeout(poll, PHONE_POLL_MS)
+        // (no answer yet; while waiting an off without an error is the state before it, or a new code's off on its way)
+        if (!s || s.pending || (q.waiting && !s.on && !s.error)) {
+          if (q.waiting && Date.now() - askedAt > PHONE_WAIT_MS) {
+            qr.value = { ...q, waiting: false, error: "No answer from the companion server" }
+          }
+          return
+        }
+        const url = s.on && s.url ? s.url : ""
+        const code = url === q.url ? q : url ? qrCode(url) : { path: "", size: 0 }   // (encoded once a link)
+        qr.value = { ...q, url, path: code.path, size: code.size, phones: Number(s.phones) || 0,
+          error: url ? "" : s.error || "", off: !url, waiting: false }
+      })
+    }
+    poll()
+  })
+}
+function stopPhone() {
+  phoneSeq++
+  clearTimeout(phoneTimer)
+  qr.value = null
+  engineLua("beamngEarth_settings and beamngEarth_settings.uiCompanionLan and " +
+    "beamngEarth_settings.uiCompanionLan(false, false) or nil", r => {
+    if (!r) { showToast("BeamNG.Earth is not loaded"); return }
+    showToast(r.ok ? "Stopped sharing with phones" : (r.error || "Could not stop sharing"))
+  })
+}
+// the box closed (or showing a Google Maps link instead), the map closed: no more polling
+watch(qr, q => { if (!q || !q.phone) { phoneSeq++; clearTimeout(phoneTimer) } })
+onUnmounted(() => { phoneSeq++; clearTimeout(phoneTimer) })
 function ctxPhone() {
   if (!ctx.value) return
   const c = ctx.value
@@ -2210,7 +2283,9 @@ const fmtLatLon = mm.fmtLatLon
 }
 .qr-svg { display: block; width: 240px; height: 240px; margin: 10px auto 6px; border-radius: 4px; }
 .qr-url { font-size: 10px; color: #9aa4ae; word-break: break-all; user-select: text; }
-.confirm.qr-box .confirm-btns { justify-content: center; }
+.confirm.qr-box .confirm-btns { justify-content: center; flex-wrap: wrap; }
+.qr-hints { margin-top: 8px; font-size: 11px; color: #9aa4ae; text-align: left; }
+.qr-hints div { margin-top: 3px; }
 .gps-stack {
   position: absolute; left: 10px; top: 56px; z-index: 6; display: flex; flex-direction: column; gap: 6px;
   align-items: flex-start;

@@ -1,10 +1,11 @@
-# Live map in the browser (the fork's Google Maps integration, phase 1)
+# Live map in the browser and on a phone (the fork's Google Maps integration, phases 1 and 2)
 
 A web page served by the world server (earthd) shows the player's car live on a Google map (Maps JavaScript API with
 the player's own key): where the car is and which way it drives, its speed, the GPS destination and the planned route.
 Clicking the map sets the GPS destination or teleports there; the page can turn Autodrive on and off and search for
 places (Photon, as the in-game map). It is opened from the game (the world map's **Live map** button) in the player's
-browser; a second monitor is the use case. Phase 2 (planned) opens the same page on a phone over the local network.
+browser; a second monitor is the use case. Phase 2 opens the same page on a phone over the local network, paired by a
+QR code ("Phone over the local network" below).
 
 Only our own data (the car, the destination, the OSRM route, Photon's results) is drawn on Google's map; nothing of
 Google's (Places, Directions, Routes) is used, so the EEA terms' "Google Maps Content with any map" rule is not touched.
@@ -70,3 +71,67 @@ The page loads `https://maps.googleapis.com/maps/api/js?key=<key>&callback=...&l
 key it shows a box to paste one (stored with `POST /api/key`, then the page reloads); Google draws its own "for
 development purposes only" map without a key, which is enough to try it. The key should be restricted to the
 **Maps JavaScript API** and to the website `http://127.0.0.1:47616/*` in Google Cloud.
+
+## Phone over the local network (phase 2)
+
+Off by default; nothing listens beyond 127.0.0.1 until the player asks. Turned on from the game (the world map's
+**Phone** button next to **Live map**) or from the PC's page (its **Phone** button); both show a QR code of the phone
+URL, scanned with the phone's camera (Android and iPhone alike: any browser, nothing installed).
+
+**Turning it on** (`Companion.set_lan(True)`, a coroutine; idempotent while on):
+- The LAN address: `--companion-lan-ip A` if given, else the IPv4 address of the interface with the default route (a
+  UDP socket `connect(("10.255.255.255", 1))` + `getsockname()`, no packet is sent), else the first private address of
+  `getaddrinfo(gethostname())`. It must be private IPv4 (10/8, 172.16/12, 192.168/16); anything else (none found, a
+  public or loopback address) is an error: `"no local network address found"` (or the address and why).
+- A second `asyncio.start_server` on `<lan ip>:<port>` (the same port as the loopback one). A bind error (port taken
+  on that address, the address gone) is an error with its text.
+- A new **phone token** (`secrets.token_urlsafe(18)`), separate from the PC token. The phone URL:
+  `http://<lan ip>:<port>/?t=<phone token>`.
+
+**Turning it off** (`set_lan(False)`): the LAN listener closes, the phone streams end, the phone token is dropped
+(an old QR code is dead). **New code** = off then on: a new token, every phone disconnected. The server stopping turns
+it off; it is never remembered across starts.
+
+**Requests on the LAN listener** (checked before anything else, in this order):
+1. The peer must be a private IPv4 address (as above) or the connection is closed without an answer.
+2. More than 20 requests with a wrong token from one peer in 60 s: `429` for that peer for the next 60 s.
+3. The Host header must be `<lan ip>:<port>`: `421` otherwise.
+4. `/api/` needs the **phone token** (the PC token is not accepted here, and the phone token is not accepted on the
+   loopback listener): `403`.
+5. `POST /api/key` and `/api/lan`: `403 {"ok": false, "error": "only on the PC"}`. Everything else (state, events,
+   search, cmd) as on the PC.
+
+**New endpoint (loopback listener only, PC token):**
+
+| Request | Answer |
+|---|---|
+| `GET /api/lan?t=` | `{"on": bool, "url": "http://192.168.1.23:47616/?t=..." \| null, "ip": "192.168.1.23" \| null, "phones": n, "error": null \| "..."}` (`error`: why the last try to turn it on failed) |
+| `POST /api/lan` (`X-BNE-Token`, JSON) | `{"on": true}`, `{"on": false}` or `{"renew": true}` (a new code) -> the same object as GET (`200`; `error` set and `on: false` when turning it on failed) |
+
+**State** (`/api/state`, the `state` event) gets `"lan": {"on": bool, "phones": n}` for everyone (no URL, no token);
+`phones` = the phone event streams open now. A change of either is a state change (pushed as usual).
+
+**Messages** (protocol 4, additive):
+
+| Direction | Message | Notes |
+|---|---|---|
+| mod -> server | `{"type": "companion_lan", "on": bool, "renew"?: true}` | the world map's Phone dialog: on when it opens (if off), renew for **New code**, off for **Stop** |
+| server -> mod | `{"type": "companion_lan_state", "on": bool, "url": str \| null, "phones": n, "error": str \| null}` | the answer to every `companion_lan`, and whenever `on` or `phones` changes (turned on or off from the page, a phone connecting or leaving); to the game connection (the one that sent `gps_state`, else the asker) |
+
+**The page on a phone** (the same files; `location.hostname` is not `127.0.0.1` / `localhost`):
+- Layout for a narrow touch screen: big buttons, one-finger panning (`gestureHandling: "greedy"`), the safe areas
+  (`viewport-fit=cover`, `env(safe-area-inset-*)`), no page zoom fighting the map.
+- No key form (the key is set on the PC): without a key the panel says so. With or without a key it tells the player to
+  allow `http://<location.host>/*` among the key's website restrictions (the phone's address differs from the PC's).
+- When the event stream drops (the phone slept, Wi-Fi changed) a "Reconnecting..." strip; on `visibilitychange` back
+  to visible the stream is reopened at once; a `403` means the code was renewed or sharing stopped: "This link has
+  expired: scan the new QR code on the PC" and no more retries.
+- The screen-wake lock needs a secure context (https), which a LAN page is not: not used.
+
+**The PC page:** a **Phone** button (loopback only) opens a box: the QR code (`/qrcode.js`, a byte-identical copy of
+the mod's `ui-vue/mods/beamngEarth/qrcode.js`, loaded with `import()`), the URL as text, "N phones connected",
+**New code**, **Stop sharing**, **Close**, and the hints below.
+
+**Hints shown with every QR code** (game and PC page): the phone must be on the same Wi-Fi / network as this PC;
+Windows may ask to allow the app through the firewall the first time (allow it on **private** networks; a network set
+to **Public** blocks phones); the link is plain HTTP on your own network: use it at home, not on public Wi-Fi.

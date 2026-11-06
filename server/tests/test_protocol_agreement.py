@@ -184,6 +184,8 @@ MOD_TO_SERVER = {
     "gps_state": {"active": F(bool), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT),
                   "autodrive": F(bool, OPT), "remaining": F(NUM, OPT), "eta": F(NUM, OPT)},
     "open_companion": {},
+    # ... and its Phone dialog (phase 2): the phone sharing on (when it opens), off (Stop), renew (New code)
+    "companion_lan": {"on": F(bool), "renew": F(bool, OPT)},
     "update_now": {},                   # the update notice's "Update now" (selfupdate.py)
     # the level select's "Random location" (randomplace.py; additive)
     "random_place": {"id": F(int)},
@@ -235,6 +237,8 @@ SERVER_TO_MOD = {
     "companion": {"port": F(int)},
     "remote_cmd": {"action": F(str), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT),
                    "on": F(bool, OPT)},
+    # ... the phone sharing (phase 2): the answer to companion_lan, and a change (on / off, a phone came or went)
+    "companion_lan_state": {"on": F(bool), "url": F(str, NULL), "phones": F(int), "error": F(str, NULL)},
     "runtime_profiler_pong": {"probe": F(int)},
     "runtime_profiler": {"profile": F(dict)},
     "hello": {"runtimeProfiler": F(int, OPT), "protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
@@ -385,6 +389,7 @@ EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs
                        "geocode_result", "route_result",             # only when the map / GPS asks
                        "map_link_result",                            # only when a short link is pasted (online)
                        "companion", "remote_cmd",                    # the live map: a Server with a Companion
+                       "companion_lan_state",                        # ... when the Phone dialog asks
                                                                      # (test_companion)
                        "cache_map_result",                           # only when the map's cache view asks
                        "area_plan_result", "areas",                  # saved areas: a Server with a Cache (test_areas)

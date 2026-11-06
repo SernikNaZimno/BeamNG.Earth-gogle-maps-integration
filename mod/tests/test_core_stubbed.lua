@@ -849,12 +849,49 @@ do
   local k = 0
   for _ in pairs(s2) do k = k + 1 end
   T.check(k == 2, 'live map: an inactive gps_state has only type and active')
+  -- phase 2, a phone over the local network: the Phone dialog's companion_lan, the server's companion_lan_state kept
+  -- (its link checked by settings), unknown from every ask to its answer
+  local lanUrl = 'http://192.168.1.23:47616/?t=abc_DEF-123'
+  T.check(core.companionLanState() == nil and settings.uiCompanionLanState().pending == true,
+    'phone: no state before the first answer')
+  T.check(settings.uiCompanionLan(true, false).ok and last('companion_lan').on == true
+    and last('companion_lan').renew == nil, 'phone: on sent')
+  serverSend({ type = 'companion_lan_state', on = true, url = lanUrl, phones = 0 })
+  T.check(pumpUntil(function() return core.companionLanState() ~= nil end, 50), 'phone: companion_lan_state kept')
+  local ls = settings.uiCompanionLanState()
+  T.check(ls.on == true and ls.url == lanUrl and ls.phones == 0 and ls.error == nil and not ls.pending,
+    'phone: the dialog\'s state')
+  local nLan = #received('companion_lan')
+  T.check(settings.uiCompanionLan(true, false).ok and #received('companion_lan') == nLan
+    and core.companionLanState() ~= nil, 'phone: on while on with a link: not asked again')
+  serverSend({ type = 'companion_lan_state', on = true, url = lanUrl, phones = 2 })
+  T.check(pumpUntil(function() return core.companionLanState().phones == 2 end, 50)
+    and settings.uiCompanionLanState().phones == 2, 'phone: a phone connecting followed')
+  T.check(settings.uiCompanionLan(true, true).ok and last('companion_lan').renew == true
+    and last('companion_lan').on == true and settings.uiCompanionLanState().pending == true,
+    'phone: New code sends renew, the old link forgotten until the answer')
+  serverSend({ type = 'companion_lan_state', on = true, url = 'http://8.8.8.8:47616/?t=abc', phones = 0 })
+  T.check(pumpUntil(function() return core.companionLanState() ~= nil end, 50), 'phone: renew answered')
+  ls = settings.uiCompanionLanState()
+  T.check(ls.on == false and ls.url == nil and type(ls.error) == 'string', 'phone: a link off the local network never shown')
+  settings.uiCompanionLan(true, false)
+  serverSend({ type = 'companion_lan_state', on = false, phones = 0, error = 'no local network address found' })
+  T.check(pumpUntil(function() return core.companionLanState() ~= nil end, 50), 'phone: a failed on answered')
+  ls = settings.uiCompanionLanState()
+  T.check(ls.on == false and ls.url == nil and ls.error == 'no local network address found', 'phone: why it failed')
+  T.check(settings.uiCompanionLan(false, false).ok and last('companion_lan').on == false
+    and last('companion_lan').renew == nil, 'phone: off sent (Stop sharing)')
+  serverSend({ type = 'companion_lan_state', on = false, phones = 0 })
+  T.check(pumpUntil(function() return core.companionLanState() ~= nil end, 50)
+    and settings.uiCompanionLanState().on == false, 'phone: off answered')
   -- a new hello: the endpoint off until its own companion, the GPS state sent again
   n = #received('gps_state')
   serverSend({ type = 'hello', protocol = 4, format = 4, cells = 64, serverVersion = '0.4.0', sessionId = 's13',
     farFormat = 'cdae', material = 'bngEarthFar_v3', nearVisual = 'mesh', horizon = true })
   T.check(pumpUntil(function() return #received('gps_state') > n end, 50) and core.companionPort() == nil
     and last('gps_state').active == false, 'live map: a new hello sends gps_state and clears the companion port')
+  T.check(core.companionLanState() == nil and not core.companionLan(true), 'phone: a new hello forgets the state, '
+    .. 'nothing sent without the endpoint')
   beamngEarth_core = savedCore
 end
 
@@ -887,8 +924,11 @@ do
   T.check(seen.id == 'traffic-reload' and seen.available, 'level start restores the live connection capability')
   core._trafficvisuals = actual
 end
+serverSend({ type = 'companion_lan_state', on = true, url = 'http://192.168.1.23:47616/?t=abc', phones = 1 })
+T.check(pumpUntil(function() return core.companionLanState() ~= nil end, 50), 'phone: a state before the disconnect')
 core.reconnect()
 T.check(core.cacheState() == nil and not core.cacheClear(), 'disconnected: numbers gone, no request sent')
+T.check(core.companionLanState() == nil, 'disconnected: the phone sharing state gone')
 beamngEarth_settings = nil
 
 core.onExtensionUnloaded()

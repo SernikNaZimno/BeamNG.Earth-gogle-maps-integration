@@ -4,7 +4,7 @@ What changed in each release of BeamNG.Earth, newest first.
 
 ## Unreleased (fork: Google Maps integration)
 
-Not in an upstream release: this fork's Google Maps integration, phases 0 and 1. Nothing of Google's is drawn on the
+Not in an upstream release: this fork's Google Maps integration, phases 0 to 2. Nothing of Google's is drawn on the
 in-game map. Phase 0 uses only Google's Maps links (no API key); phase 1's live map page uses the Maps JavaScript API
 with your own key.
 
@@ -13,6 +13,10 @@ with your own key.
   its speed, the GPS destination, the route and the time to go. Click the map to set the GPS destination or teleport
   there; search for places; turn Autodrive on and off. Needs your own Maps JavaScript API key (pasted on the page);
   served by the world server on 127.0.0.1:47616 only (`--companion-port`, 0 turns it off), with a random token.
+- **Live map on your phone**: the **Phone** button (in the game next to Live map, and on the live map page) shows a QR
+  code; scan it and the live map opens in the phone's browser over your home network, laid out for a phone. Off until
+  you press it; the phone gets its own code (**New code**, **Stop sharing**) and cannot change the key.
+  `--companion-lan-ip` picks the network address when the PC has several.
 - **Open in Google Maps** and **Street View here** on the world map's right-click menu: the spot in Google Maps, or
   Google's Street View nearest it, opens in your browser.
 - **Send to phone (QR)** on the same menu: a QR code of the spot's Google Maps link to scan with your phone's camera

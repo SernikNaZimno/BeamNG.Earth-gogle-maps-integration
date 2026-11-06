@@ -22,6 +22,7 @@ python3 server/earthd.py --port 47613 --user-dir ~/.local/share/BeamNG/BeamNG.dr
 |---|---|---|
 | `--port` | `47613` | TCP port on 127.0.0.1 (`0` picks a free port and prints it) |
 | `--companion-port` | `47616` | The live map in the browser (`server/companion.py`, see "Live map in the browser"), on 127.0.0.1; `0` = off. A port in use only logs a warning and leaves it off |
+| `--companion-lan-ip` | (none) | The PC's address a phone opens the live map on (phase 2, "Phone over the local network" in docs/COMPANION.md) once the player turns the phone sharing on; default: the IPv4 address of the interface with the default route, else the host name's first private one. A private IPv4 address only (10/8, 172.16/12, 192.168/16): anything else is the error `companion_lan_state` and `/api/lan` report. Nothing listens beyond 127.0.0.1 until the player asks |
 | `--user-dir` | `~/.local/share/BeamNG/BeamNG.drive/current` | BeamNG user folder. Output goes to `<user-dir>/temp/beamngEarth/<sessionId>/`, which the game sees as `/temp/beamngEarth/<sessionId>/` |
 | `--cache-dir` | `~/.cache/beamng-earth` | Download cache root. DEM tiles: `<cache-dir>/dem/<source>/<z>/<x>/<y>.<ext>`; per-host request counters of each UTC day: `<cache-dir>/netstats/<YYYY-MM-DD>.json`; the layout version `VERSION` and the last-use index `index.tsv` (see "Download cache") |
 | `--cache-cap` | the last cap set on the mod's page, else `20` | Size cap of the download cache in GB (`cache.py`; 0 = unlimited). Over it, a background thread removes the least recently used files down to 90 % (at most every 3 min); never what this session used within the hour, the gravity model or `netstats/`. The mod's settings page can change it (`cache` messages); the server keeps that cap in its index for the next start, and this flag overrides it |
@@ -148,6 +149,7 @@ for descriptor overflow. [Distant traffic](../docs/DISTANT_TRAFFIC.md) maps the 
 | `{"type":"pose","anchorId":A,"x","y","z","vx","vy","lat","lon","speed","cam":{"x","y","z","fx","fy","fz","fovDeg"},"held":[a,…],"sessions":["…"]}` | ~2 Hz. Drives LOD selection, the predicted block and the terrain prefetch. `cam` is optional and only stored for now (the camera-weighted priority is phase 4). A pose with a newer known anchor implies `commit_anchor`; a late pose of the previous anchor is transformed into the active frame. `held` (optional): previous anchors of this session whose tile objects the mod still has (their files stay; the mod sends none while its tiles belong to another server's session). `sessions` (optional): as in `hello`; an adopted folder this connection named before and names no longer is released (deleted through the delete queue) unless another connection still names it. After a server restart the mod sends no pose (and no `prepare_terrain`) until its resync commits: its anchor id is the earlier session's. |
 | `{"type":"gps_state","active":b,"lat":d,"lon":d,"name":"…","autodrive":b,"remaining":m,"eta":s}` | The GPS's destination for the live map in the browser (`server/companion.py`, docs/COMPANION.md; the fork's Google Maps integration, phase 1; additive like `weather`): after every `hello`, whenever the destination, its name or autodrive changes, and every 2 s while active (`remaining` / `eta`). `active: false`: no destination (the other fields left out). Marks the connection as the game's (`Server.companion_conn`: the last one that sent it): the live map's car comes from its poses, its route from its `route`, the page's commands go to it. |
 | `{"type":"open_companion"}` | The world map's **Live map** button: the server opens `http://127.0.0.1:<port>/?t=<token>` in the player's browser (`updates.open_companion`: that URL only, launched as `open_page` launches its pages). Nothing happens with `--companion-port 0`. |
+| `{"type":"companion_lan","on":b,"renew":true}` | The world map's **Phone** dialog (the live map's phase 2, docs/COMPANION.md "Phone over the local network"; additive): `on: true` when it opens (if off; idempotent while on), `renew: true` with it for **New code** (a new phone token, every phone disconnected), `on: false` for **Stop**. The server runs `Companion.set_lan` / `renew_lan` and answers `companion_lan_state` to the asker. |
 | `{"type":"map_link","id":N,"url":"…"}` | A Google Maps share link pasted into the map's search box or the Places panel's Go box (`server/maplinks.py`; the fork's Google Maps integration, phase 0; additive like `weather`, no protocol bump): `https://maps.app.goo.gl/<id>` or the older `https://goo.gl/maps/<id>` (`gmaps.shortLink` cuts it out of the pasted text). Resolved on the UI pool (`maplinks.resolve`): one GET per hop to `maps.app.goo.gl` / `goo.gl` only (at most 4 GETs within 20 s, `https` without an explicit port only; a redirect to any other host is refused, never followed), the `Location` of the 3xx is the answer; the long `google.com/maps` link is never fetched, and an EU `consent.google.com/...?continue=` redirect is read for its `continue` parameter. A long Google Maps link comes back as it is. Always answered with a `map_link_result` of the same `id`. Opening a Maps link goes through the existing `open_page`, whose allowlist (`updates.OPEN_PREFIXES`) also takes `https://www.google.com/maps/search/?api=1&`, `/maps/dir/?api=1&` and `/maps/@?api=1&` (built in `gmaps.lua` from numbers). |
 
 ### server → mod
@@ -171,6 +173,7 @@ for descriptor overflow. [Distant traffic](../docs/DISTANT_TRAFFIC.md) maps the 
 | `{"type":"weather","v":1,"t":epoch,"lat","lon","code":wmo,"isDay","cover":{"total","low","mid","high"},"baseM","baseAglM","rainMmH","snowCmH","visM","fog","thunder","wind":{"ms","fromDeg","gustMs"},"aloft":{"ms","fromDeg"},"tempC","dewC","elevM","slTempC","pressureHpa","utcOffsetS","tz","credit"}` | Real weather (`server/weather.py`; additive, no protocol bump: both sides ignore unknown types). Open-Meteo's current (15-min) conditions at the 0.1° cell of the player's `pose.lat/lon`, fetched when there is none yet, every 10 min, or after 25 km (one request in flight; a failure keeps the last weather and retries after 2 min, or after the host's Retry-After / open circuit if longer; concurrent requests for one cell share a fetch); cached per (cell, 15-min slot) for all connections; re-sent on `hello`. Rates per hour from the 15-min sums (`× 3600 / interval`); a weather code with a zero sum gets a light floor (drizzle 0.3, rain 1, thunder 4 mm/h; snow 0.5 cm/h). `visM` (null = unknown) is ≤ 800 m with fog codes 45/48. `baseM`/`baseAglM`: the drawn deck's base (= max(low, mid)): a low deck at the LCL (125 m/K × (T − Td)), a mid deck ≥ 3000 m ASL; clamped 200–6000 m above the model ground `elevM`. `slTempC` = `tempC` + 0.0065 × `elevM` (the game lowers it with height). `aloft` = 700 hPa wind (cloud drift). `utcOffsetS`/`tz` = the place's real time zone (`timezone=auto`). `credit` = "Weather data by Open-Meteo.com" (CC BY 4.0), also in `hello.attribution` while weather is on. The mod's mapping is `beamngEarth/weather.lua`. |
 | `{"type":"companion","port":n}` | After `hello` when the live map in the browser is on (`--companion-port`, default 47616; additive): the mod shows the world map's **Live map** button only then. |
 | `{"type":"remote_cmd","action":"gps"\|"clear_gps"\|"teleport"\|"autodrive","lat":d,"lon":d,"name":"…","on":b}` | A command from the live map's page (`POST /api/cmd`, checked by `companion.check_cmd`: `lat`/`lon` for `gps` and `teleport`, `name` optional for `gps`, `on` for `autodrive`), to the game's connection (the last one that sent `gps_state`; none: the page gets a 409). The mod runs it as the world map would (`gps.setDestination`, `gps.clear`, `places.goTo`, `gps.setAutodrive`). |
+| `{"type":"companion_lan_state","on":b,"url":"http://192.168.1.23:47616/?t=…"\|null,"phones":n,"error":"…"\|null}` | The phone sharing (`Companion.lan_info`; additive): the answer to every `companion_lan`, and whenever `on`, `phones` (the phones' open event streams) or the code changes (turned on or off from the PC's page, a phone connecting or leaving) to the game's connection (the last one that sent `gps_state`; none: nobody is told). `url`: the phone's page with the phone token (the QR code), null while off; `error`: why the last try to turn it on failed (no LAN address, the port taken on it), `"the live map is off (--companion-port 0)"` without the endpoint. |
 | `{"type":"map_link_result","id":N,"url":"…"}` or `{"type":"map_link_result","id":N,"error":"…","text":"…"}` | The answer to `map_link` (additive). `url` = the long Google Maps link the short link leads to; the mod reads the point from it (`places.parseMapLink`: `!3d…!4d…`, `?q=`/`?query=`/`?ll=lat,lon`, `/@lat,lon`) and goes there, or, when it names a place without coordinates (`?q=Big+Ben&ftid=…`, `/maps/place/…`), puts the name in the map's search (`gmaps.placeName`). `error` = the exception (at most 200 characters: not a short link, offline, rate limited, expired, a redirect off the short hosts), `text` = the map's message for it (`maplinks.error_text`). |
 
 Far-field state per connection (`earthd.Connection`): **D** the desired set, **C** the tiles of
@@ -735,24 +738,39 @@ clicking the map sets the destination or teleports, the page turns Autodrive on 
 as the world map). `Companion` is a small HTTP endpoint on 127.0.0.1:`--companion-port` (default 47616, the port the
 key's website restriction names), as `maptiles.py`'s (raw asyncio, one request per connection):
 
-- `GET /`, `/index.html`, `/app.js`, `/style.css`: the page's files (no token; 404 for any other name or while the
-  folder is missing);
+- `GET /`, `/index.html`, `/app.js`, `/style.css`, `/qrcode.js`: the page's files (no token; 404 for any other name
+  or while the folder is missing; `qrcode.js` is a byte-identical copy of the mod's `ui-vue/mods/beamngEarth/qrcode.js`,
+  checked by `test_companion`);
 - `GET /api/state?t=`: `{"v":1,"connected","player":{"lat","lon","heading","speed","t"},"gps":{"lat","lon","name",
-  "autodrive","remaining","eta"},"routeVersion","apiKey"}` (heading in compass degrees from the pose's `vx`, `vy`
-  while faster than 1 m/s, else the last);
+  "autodrive","remaining","eta"},"routeVersion","apiKey","lan":{"on","phones"}}` (heading in compass degrees from
+  the pose's `vx`, `vy` while faster than 1 m/s, else the last);
 - `GET /api/events?t=`: server-sent events, `state` at once and on a change (at most 4 a second, changes in between
   coalesced), `route` (`{"version","points"}`) at once when there is one and on every new one, `: ping` every 15 s;
   8 streams at most (503);
 - `POST /api/cmd` (`X-BNE-Token`): `gps` / `clear_gps` / `teleport` / `autodrive` -> `remote_cmd` to the game's
   connection (`Server.companion_cmd`; 409 with none); `POST /api/key`: the key in `<user-dir>/google_maps_key.txt`
   (`""` deletes it); `GET /api/search?t=&q=`: `geocode.search` biased to the car (`Server.companion_search`, the UI
-  pool).
+  pool);
+- `GET /api/lan?t=`, `POST /api/lan` (`{"on": true}`, `{"on": false}`, `{"renew": true}`): the phone sharing's
+  `{"on","url","ip","phones","error"}` (200, also when turning it on failed: `on` false, `error` set).
 
 Every `/api/` request needs the token earthd makes at start (`?t=` on GET, the `X-BNE-Token` header on POST: 403),
 every request a `Host` of `127.0.0.1:<port>` / `localhost:<port>` (421: DNS rebinding); POST bodies 4 KB at most
 (413); `Cache-Control: no-store` always, never a CORS header. earthd feeds it from the game's connection (the last
 one that sent `gps_state`): its poses (`update_pose`), its `gps_state` (`set_gps`), its planned routes (`set_route`),
 and its going (`set_connected(False)`: the destination and route cleared, the car's last position kept).
+
+**The phone over the local network** (phase 2; off by default, never remembered across starts): `set_lan(True)`
+picks the LAN address (`lan_address`: `--companion-lan-ip`, else the default route's interface by a UDP
+`connect(("10.255.255.255", 1))` + `getsockname()` that sends nothing, else `getaddrinfo(gethostname())`; private IPv4
+only), opens a second listener on `<lan ip>:<port>` and makes a phone token of its own (the phone URL
+`http://<lan ip>:<port>/?t=<phone token>`, the QR code's); `set_lan(False)` closes it, ends the phones' event streams
+and drops the token; `renew_lan` is both (a new code). Its requests are checked first, in this order: the peer must be
+private IPv4 (else the connection is closed without an answer), more than 20 wrong tokens from one peer in 60 s get
+that peer 429 for 60 s, the `Host` must be `<lan ip>:<port>` (421), `/api/` needs the phone token (the PC token is
+refused there and the phone token on 127.0.0.1: 403), `/api/key` and `/api/lan` are 403 `"only on the PC"`.
+earthd turns it on and off for the mod's `companion_lan` and tells the game's connection of every change
+(`Server.companion_lan_push`, `Companion.on_lan_change`); the server stopping turns it off (`Companion.close`).
 
 ## Tests
 
@@ -849,7 +867,11 @@ body-size checks, the state's shape, commands checked and forwarded (409 without
 in a temporary user folder, the search (biased to the car, its errors), the page's files (content types, 404s),
 real-socket requests and the event stream (its framing, coalescing, pings, the stream cap, clean-up), and earthd's
 glue (gps_state marks the game's connection, poses and routes reach the state, remote_cmd reaches the mod, `companion`
-after hello).
+after hello, `companion_lan` answered with `companion_lan_state`); the phone sharing: the LAN address choice (a fake
+socket module), the LAN listener's checks in order through `respond(lan=True, peer=...)` (the peer, the 429 rule on
+a fake clock, the Host, the tokens kept apart, the PC-only endpoints), `/api/lan`, `state.lan`, on / off / renew (the
+old code dead), the listener on a real socket (served on 127.0.0.1 through the `is_lan` test hook) and `qrcode.js`
+byte-identical to the mod's.
 `test_maplinks.py` (no network: a scripted fake transport): Google Maps short and long links told apart (look-alike
 hosts, bad characters and over-long links refused), one redirect resolved without fetching the long link, a
 `goo.gl/maps` → `maps.app.goo.gl` chain and an EU consent redirect read for its `continue`, loops, redirects off the

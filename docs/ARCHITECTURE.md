@@ -161,7 +161,7 @@ the companion asking `maps.app.goo.gl` / `goo.gl` where a pasted share link redi
 is the Google Maps Platform EEA terms (since 2025-07-08): Google Maps content may not be shown with
 non-Google maps, and Street View and 3D tiles are blocked for EEA projects. Phase 1 (built): a
 web page served by the companion with the Google Maps JavaScript API (the user's own key) showing
-the car live on the PC, our own data only (docs/COMPANION.md). Phase 2 (planned): the same page on
+the car live on the PC, our own data only (docs/COMPANION.md). Phase 2 (built): the same page on
 a phone over the LAN, paired by QR code.
 
 ## Roadmap
@@ -830,7 +830,10 @@ Maps URLs: no key, nothing of Google's on our map, Google Maps itself opened out
   127.0.0.1:47616 (token, Host check, SSE for the state and the route, `/api/cmd` -> `remote_cmd` to the game, run by
   the mod's `remote.lua`); the mod sends `gps_state`. The contract is docs/COMPANION.md. Tests:
   `server/tests/test_companion.py`, `mod/tests/test_remote.lua`.
-- Phase 2 (planned, not built): the same page on a phone over the LAN with QR pairing.
+- Phase 2, the phone (branch feature/google-maps-phase2): on request (`companion_lan` from the map's Phone dialog, or
+  `POST /api/lan` from the PC page) the companion also listens on the PC's private LAN address (same port) with a
+  separate phone token; private peers only, a 429 for token guessing, no key changes from phones. The page lays itself
+  out for a phone when not opened on 127.0.0.1. docs/COMPANION.md "Phone over the local network" has the rules.
 
 ## Download cache: size cap and LRU eviction (`server/cache.py`; docs/ROADMAP.md "Caching" 1, parts of 3 and 5; built offline 2026-10-11, feature/cache-cap)
 Before, every raw download stayed on disk forever (~/.cache/beamng-earth: 2.4 GB, ~43k files after

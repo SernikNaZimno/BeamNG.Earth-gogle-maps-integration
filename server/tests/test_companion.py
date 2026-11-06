@@ -1,7 +1,9 @@
 """companion: the live map in the browser (docs/COMPANION.md): the pure parts (heading, checks, state, framing), the
 request handler without sockets, the real endpoint over sockets (the event stream: framing, coalescing, pings, the
-stream cap, clean-up) and earthd's glue (gps_state marks the game's connection, its poses / routes reach the state,
-the page's commands reach the mod as remote_cmd, hello is followed by "companion")."""
+stream cap, clean-up), the phone over the local network (the LAN address, the LAN listener's checks in order, the
+429 rule, the tokens kept apart, /api/lan, state.lan, on / off / renew, its listener on a socket, qrcode.js the mod's
+copy) and earthd's glue (gps_state marks the game's connection, its poses / routes reach the state, the page's
+commands reach the mod as remote_cmd, hello is followed by "companion", companion_lan -> companion_lan_state)."""
 import asyncio
 import json
 import os
@@ -132,7 +134,7 @@ class FeedsTest(unittest.TestCase):
     def test_state_shape(self):
         c = self.c
         self.assertEqual(c.state(), {"v": 1, "connected": False, "player": None, "gps": None, "routeVersion": 0,
-                                     "apiKey": ""})
+                                     "apiKey": "", "lan": {"on": False, "phones": 0}})
         c.set_connected(True)
         c.update_pose(50.06, 19.94, 13.4, 0.0, 13.4)
         c.set_gps({"active": True, "lat": 52.23, "lon": 21.01, "name": "Warsaw", "autodrive": False,
@@ -143,7 +145,7 @@ class FeedsTest(unittest.TestCase):
                              "player": {"lat": 50.06, "lon": 19.94, "heading": 90.0, "speed": 13.4, "t": 1793900000.0},
                              "gps": {"lat": 52.23, "lon": 21.01, "name": "Warsaw", "autodrive": False,
                                      "remaining": 254000.0, "eta": 9800.0},
-                             "routeVersion": 1, "apiKey": ""})
+                             "routeVersion": 1, "apiKey": "", "lan": {"on": False, "phones": 0}})
         self.assertEqual(c.url, f"http://127.0.0.1:{PORT}/?t={TOKEN}")
 
     def test_pose(self):
@@ -301,14 +303,16 @@ class RespondTest(unittest.TestCase):
         self.assertEqual(self.get("/")[0], 404)                     # the page not there yet
         web = os.path.join(self.tmp.name, "web")
         os.makedirs(web)
-        for name, text in (("index.html", "<!doctype html>"), ("app.js", "1;"), ("style.css", "a{}")):
+        for name, text in (("index.html", "<!doctype html>"), ("app.js", "1;"), ("style.css", "a{}"),
+                           ("qrcode.js", "2;")):
             with open(os.path.join(web, name), "w", encoding="utf-8") as f:
                 f.write(text)
         with open(os.path.join(web, "secret.txt"), "w", encoding="utf-8") as f:
             f.write("no")
         for path, ctype, text in (("/", "text/html", "<!doctype html>"), ("/index.html", "text/html", "<!doctype html>"),
                                   ("/?t=" + TOKEN, "text/html", "<!doctype html>"),
-                                  ("/app.js", "text/javascript", "1;"), ("/style.css", "text/css", "a{}")):
+                                  ("/app.js", "text/javascript", "1;"), ("/style.css", "text/css", "a{}"),
+                                  ("/qrcode.js", "text/javascript", "2;")):
             st, got_type, body = self.get(path)
             self.assertEqual((st, got_type, body.decode()), (200, ctype + "; charset=utf-8", text), path)
         for path in ("/secret.txt", "/../companion.py", "/web/app.js", "/favicon.ico", "/APP.JS"):
@@ -316,6 +320,357 @@ class RespondTest(unittest.TestCase):
         self.assertEqual(run(self.c.respond("POST", "/", dict(HOST), b""))[0], 405)
         os.remove(os.path.join(web, "app.js"))
         self.assertEqual(self.get("/app.js")[0], 404)
+
+
+LAN_IP = "192.168.1.23"
+LAN_HOST = {"host": f"{LAN_IP}:{PORT}"}
+PHONE = "192.168.1.50"                      # a phone's address on the same network
+
+
+class FakeSocketModule:
+    """socket's parts lan_address uses: the default route's UDP trick (route: its address, or an OSError) and the host
+    name's addresses (hostaddrs, or an OSError)."""
+    AF_INET, SOCK_DGRAM = companion.socket.AF_INET, companion.socket.SOCK_DGRAM
+
+    def __init__(self, route=None, hostaddrs=()):
+        self.route, self.hostaddrs = route, hostaddrs
+        self.connected, self.closed = [], 0
+
+    def socket(self, family, kind):
+        mod = self
+
+        class Udp:
+            def connect(self, addr):
+                mod.connected.append((family, kind, addr))
+                if isinstance(mod.route, OSError):
+                    raise mod.route
+
+            def getsockname(self):
+                return (mod.route, 54321)
+
+            def close(self):
+                mod.closed += 1
+        return Udp()
+
+    def gethostname(self):
+        return "gaming-pc"
+
+    def getaddrinfo(self, host, port, family):
+        assert (host, family) == ("gaming-pc", self.AF_INET)
+        if isinstance(self.hostaddrs, OSError):
+            raise self.hostaddrs
+        return [(family, 1, 6, "", (ip, 0)) for ip in self.hostaddrs]
+
+
+class LanAddressTest(unittest.TestCase):
+    def test_private_only(self):
+        for ip in ("10.0.0.1", "10.255.255.254", "172.16.0.1", "172.31.255.1", "192.168.0.1", "192.168.255.254"):
+            self.assertTrue(companion.is_lan(ip), ip)
+        for ip, why in (("127.0.0.1", "loopback"), ("169.254.3.4", "link-local"), ("8.8.8.8", "public"),
+                        ("172.32.0.1", "public"), ("172.15.255.1", "public"), ("0.0.0.0", "no address"),
+                        ("100.64.0.1", ""), ("::1", "not an IPv4"), ("fe80::1", "not an IPv4"),
+                        ("192.168.1", "not an IPv4"), ("", "not an IPv4"), (None, "not an IPv4"),
+                        ("224.0.0.1", "")):
+            self.assertFalse(companion.is_lan(ip), ip)
+            self.assertIn(why, companion.why_not_lan(ip), ip)
+
+    def test_default_route_first(self):
+        fake = FakeSocketModule("192.168.1.23", ["10.0.0.5"])
+        self.assertEqual(companion.lan_address(sock=fake), "192.168.1.23")
+        self.assertEqual(fake.connected, [(fake.AF_INET, fake.SOCK_DGRAM, ("10.255.255.255", 1))])
+        self.assertEqual(fake.closed, 1)
+
+    def test_host_name_fallback(self):
+        # the default route's address public (a PC straight on the modem): the host name's first private one
+        fake = FakeSocketModule("85.1.2.3", ["127.0.1.1", "169.254.1.1", "10.0.0.5", "192.168.1.9"])
+        self.assertEqual(companion.lan_address(sock=fake), "10.0.0.5")
+        fake = FakeSocketModule(OSError("network is unreachable"), ["172.20.1.2"])     # (no default route)
+        self.assertEqual(companion.lan_address(sock=fake), "172.20.1.2")
+        self.assertEqual(fake.closed, 1)                # (closed after a failed connect too)
+
+    def test_none_found(self):
+        with self.assertRaises(companion.LanError) as cm:
+            companion.lan_address(sock=FakeSocketModule(OSError("unreachable"), OSError("no name")))
+        self.assertEqual(str(cm.exception), "no local network address found")
+        with self.assertRaises(companion.LanError) as cm:
+            companion.lan_address(sock=FakeSocketModule("85.1.2.3", []))
+        self.assertEqual(str(cm.exception), "no local network address found (85.1.2.3 is a public address)")
+        with self.assertRaises(companion.LanError) as cm:
+            companion.lan_address(sock=FakeSocketModule("0.0.0.0", ["127.0.0.1"]))
+        self.assertEqual(str(cm.exception), "no local network address found (127.0.0.1 is a loopback address)")
+
+    def test_override(self):
+        fake = FakeSocketModule(OSError("must not be asked"), OSError("must not be asked"))
+        self.assertEqual(companion.lan_address("192.168.50.2", sock=fake), "192.168.50.2")
+        self.assertEqual(fake.connected, [])
+        for bad, why in (("8.8.8.8", "a public address"), ("127.0.0.1", "a loopback address"),
+                         ("my-pc", "not an IPv4 address")):
+            with self.assertRaises(companion.LanError) as cm:
+                companion.lan_address(bad, sock=fake)
+            self.assertEqual(str(cm.exception), f"--companion-lan-ip {bad}: {why}")
+
+    def test_check_lan(self):
+        self.assertIs(companion.check_lan({"on": True}), True)
+        self.assertIs(companion.check_lan({"on": False}), False)
+        self.assertEqual(companion.check_lan({"renew": True}), "renew")
+        for bad in (None, [], {}, {"on": 1}, {"on": "true"}, {"renew": 1}, {"renew": False}):
+            with self.assertRaises(companion.BadRequest, msg=bad):
+                companion.check_lan(bad)
+
+
+class FakeServer:
+    """What asyncio.start_server returns, as far as the phone sharing uses it."""
+
+    def __init__(self, host, port):
+        self.host, self.port, self.closed = host, port, False
+
+    def close(self):
+        self.closed = True
+
+
+class LanRespondTest(unittest.TestCase):
+    """The phone sharing without sockets: set_lan / renew_lan (asyncio.start_server faked), the LAN listener's checks
+    through respond(lan=True, peer=...) in the contract's order, the 429 rule on a fake clock, /api/lan, state.lan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = 1000.0
+        self.sent, self.told, self.servers = [], [], []
+        self.c = make(self.tmp.name, clock=lambda: self.now, send_cmd=lambda cmd: self.sent.append(cmd) or True,
+                      search=lambda q, lat, lon: [{"name": "A", "lat": 1, "lon": 2}],
+                      on_lan_change=lambda: self.told.append(self.c.lan_info()))
+        self.c.lan_address = lambda: LAN_IP
+
+        async def start_server(handler, host, port, limit=None):
+            self.servers.append(FakeServer(host, port))
+            return self.servers[-1]
+        patcher = mock.patch.object(companion.asyncio, "start_server", start_server)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def on(self):
+        info = run(self.c.set_lan(True))
+        self.assertTrue(info["on"], info)
+        return self.c.lan_token
+
+    def lan(self, method, target, token=None, peer=PHONE, headers=LAN_HOST, body=b""):
+        h = dict(headers)
+        if token is not None:
+            h["x-bne-token"] = token
+        return run(self.c.respond(method, target, h, body, lan=True, peer=peer))
+
+    def pc_post(self, path, obj):
+        return run(self.c.respond("POST", path, dict(HOST, **{"x-bne-token": TOKEN}), json.dumps(obj).encode()))
+
+    def test_on_off_renew(self):
+        c = self.c
+        self.assertEqual(c.lan_info(), {"on": False, "url": None, "ip": None, "phones": 0, "error": None})
+        token = self.on()
+        self.assertNotEqual(token, TOKEN)
+        self.assertGreaterEqual(len(token), 24)
+        self.assertEqual(c.lan_info(), {"on": True, "url": f"http://{LAN_IP}:{PORT}/?t={token}", "ip": LAN_IP,
+                                        "phones": 0, "error": None})
+        self.assertEqual((self.servers[0].host, self.servers[0].port), (LAN_IP, PORT))    # the same port
+        self.assertEqual(c.state()["lan"], {"on": True, "phones": 0})          # (no URL, no token in the state)
+        self.assertNotIn(token, json.dumps(c.state()))
+        self.assertEqual(len(self.told), 1)
+        self.assertEqual(run(c.set_lan(True))["url"], c.lan_url)               # idempotent: the same code
+        self.assertEqual((len(self.servers), c.lan_token, len(self.told)), (1, token, 1))
+        info = run(c.renew_lan())                                              # a new code: off then on
+        self.assertNotEqual(c.lan_token, token)
+        self.assertTrue(self.servers[0].closed)
+        self.assertEqual((len(self.servers), info["url"], len(self.told)), (2, c.lan_url, 2))   # (told once)
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 403)    # the old QR code is dead
+        self.assertEqual(self.lan("GET", f"/api/state?t={c.lan_token}")[0], 200)
+        info = run(c.set_lan(False))
+        self.assertEqual(info, {"on": False, "url": None, "ip": None, "phones": 0, "error": None})
+        self.assertTrue(self.servers[1].closed)
+        self.assertIsNone(c.lan_token)
+        self.assertEqual(len(self.told), 3)
+        self.assertEqual(self.told[-1]["on"], False)
+        run(c.set_lan(False))                                                  # (already off: nothing told)
+        self.assertEqual(len(self.told), 3)
+        self.assertEqual(self.lan("GET", "/")[0], 421)                         # off: nothing is ours any more
+
+    def test_on_fails(self):
+        c = self.c
+
+        def none():
+            raise companion.LanError("no local network address found")
+        c.lan_address = none
+        info = run(c.set_lan(True))
+        self.assertEqual(info, {"on": False, "url": None, "ip": None, "phones": 0,
+                                "error": "no local network address found"})
+        self.assertEqual((self.servers, self.told), ([], []))
+        c.lan_address = lambda: "127.0.0.1"         # (an injected address still has to be private)
+        self.assertIn("127.0.0.1 is a loopback address", run(c.set_lan(True))["error"])
+
+        async def taken(handler, host, port, limit=None):
+            raise OSError(10048, "Only one usage of each socket address is normally permitted")
+        c.lan_address = lambda: LAN_IP
+        with mock.patch.object(companion.asyncio, "start_server", taken):
+            info = run(c.set_lan(True))
+        self.assertEqual((info["on"], info["error"]),
+                         (False, f"cannot listen on {LAN_IP}:{PORT}: Only one usage of each socket address is "
+                                 "normally permitted"))
+        self.assertTrue(self.on())
+        self.assertIsNone(c.lan_info()["error"])    # (cleared once it worked)
+        c.port = None                               # (the live map itself not started: nothing to share)
+        c._lan_off()
+        self.assertEqual(run(c.set_lan(True))["error"], "the live map is off")
+
+    def test_close_turns_it_off(self):
+        self.on()
+        self.c.close()
+        self.assertTrue(self.servers[0].closed)
+        self.assertEqual(self.c.lan_info()["on"], False)
+        self.assertIn("off", run(self.c.set_lan(True))["error"])     # (the server stopping: never on again)
+
+    def test_peer_must_be_private(self):
+        token = self.on()
+        for peer in ("8.8.8.8", "127.0.0.1", "169.254.9.9", "::1", None, "100.64.1.1"):
+            self.assertIs(self.lan("GET", f"/api/state?t={token}", peer=peer), companion.CLOSED, peer)
+            self.assertIs(self.lan("GET", "/", peer=peer), companion.CLOSED, peer)
+        for peer in ("192.168.1.50", "10.1.2.3", "172.16.4.4", LAN_IP):    # (the PC itself over its LAN address)
+            self.assertEqual(self.lan("GET", f"/api/state?t={token}", peer=peer)[0], 200, peer)
+
+    def test_host(self):
+        token = self.on()
+        for host in (HOST, {"host": f"localhost:{PORT}"}, {"host": f"{LAN_IP}:1"}, {"host": "evil.example:47616"},
+                     {}, {"host": f"192.168.1.24:{PORT}"}):
+            self.assertEqual(self.lan("GET", f"/api/state?t={token}", headers=host)[0], 421, host)
+            self.assertEqual(self.lan("GET", "/", headers=host)[0], 421, host)
+        self.assertEqual(run(self.c.respond("GET", f"/api/state?t={TOKEN}", dict(LAN_HOST)))[0], 421)  # (loopback)
+
+    def test_tokens_kept_apart(self):
+        token = self.on()
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 200)
+        self.assertEqual(self.lan("GET", f"/api/state?t={TOKEN}")[0], 403)                 # the PC's: not here
+        self.assertEqual(run(self.c.respond("GET", f"/api/state?t={token}", dict(HOST)))[0], 403)   # nor there
+        self.assertEqual(run(self.c.respond("GET", f"/api/state?t={TOKEN}", dict(HOST)))[0], 200)
+        self.assertEqual(self.lan("POST", "/api/cmd", TOKEN, body=b'{"action":"clear_gps"}')[0], 403)
+        self.c.set_connected(True)
+        r = self.lan("POST", "/api/cmd", token, body=b'{"action":"autodrive","on":true}')     # the phone drives
+        self.assertEqual((r[0], body_of(r)), (200, {"ok": True}))
+        self.assertEqual(self.sent, [{"action": "autodrive", "on": True}])
+        self.assertEqual(self.lan("POST", f"/api/cmd?t={token}", body=b'{"action":"clear_gps"}')[0], 403)
+        self.assertEqual(self.lan("GET", f"/api/search?t={token}&q=abc")[0], 200)
+        self.assertEqual(self.lan("GET", "/index.html")[0], 404)       # the page's files need no token (none here)
+
+    def test_pc_only(self):
+        token = self.on()
+        for method, path, body in (("POST", "/api/key", json.dumps({"key": KEY}).encode()),
+                                   ("GET", f"/api/key?t={token}", b""), ("GET", f"/api/lan?t={token}", b""),
+                                   ("POST", "/api/lan", b'{"on": false}'), ("POST", "/api/lan", b'{"renew": true}')):
+            r = self.lan(method, path, token if method == "POST" else None, body=body)
+            self.assertEqual((r[0], body_of(r)), (403, {"ok": False, "error": "only on the PC"}), path)
+        self.assertEqual((self.c.api_key, self.c.lan_token), ("", token))       # nothing stored, nothing renewed
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "google_maps_key.txt")))
+        r = self.lan("POST", "/api/key", TOKEN, body=json.dumps({"key": KEY}).encode())    # (the token first)
+        self.assertEqual(body_of(r)["error"], "wrong or missing token")
+
+    def test_wrong_tokens_429(self):
+        c = self.c
+        token = self.on()
+        for i in range(20):                                 # 20 wrong ones in 60 s: still only 403s
+            self.assertEqual(self.lan("GET", f"/api/state?t=guess{i}")[0], 403, i)
+            self.now += 2.9
+        r = self.lan("GET", "/api/state?t=guess21")         # the 21st within 60 s: blocked
+        self.assertEqual((r[0], body_of(r)["ok"]), (429, False))
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 429)     # everything, the right code too
+        self.assertEqual(self.lan("GET", "/")[0], 429)
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}", peer="192.168.1.51")[0], 200)  # (only that peer)
+        self.assertEqual(run(c.respond("GET", f"/api/state?t={TOKEN}", dict(HOST)))[0], 200)  # (and not the PC)
+        self.now += 59.0
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 429)
+        self.now += 1.01                                    # 60 s on: served again, counting from nothing
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 200)
+        self.assertEqual(self.lan("GET", "/api/state?t=again")[0], 403)
+        self.assertEqual((c._blocked, list(c._wrong)), ({}, [PHONE]))           # (the old block forgotten)
+        # spread out: 20 a minute for ever never blocks (the window slides)
+        for i in range(60):
+            self.now += 3.01
+            self.assertEqual(self.lan("GET", f"/api/state?t=slow{i}", peer="10.0.0.9")[0], 403, i)
+        # the wrong-token table is bounded (many peers on a /8)
+        with mock.patch.object(companion, "WRONG_PEERS_MAX", 5):
+            for i in range(9):
+                self.lan("GET", "/api/state?t=x", peer=f"10.9.0.{i}")
+            self.assertLessEqual(len(c._wrong), 5)
+        # the static files and wrong hosts do not count, only wrong tokens
+        for _ in range(30):
+            self.lan("GET", "/app.js")
+            self.lan("GET", f"/api/state?t={token}", headers={"host": "x:1"}, peer="10.0.0.77")
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}")[0], 200)
+        self.assertEqual(self.lan("GET", f"/api/state?t={token}", peer="10.0.0.77")[0], 200)
+
+    def test_api_lan_on_the_pc(self):
+        c = self.c
+        r = run(c.respond("GET", f"/api/lan?t={TOKEN}", dict(HOST)))
+        self.assertEqual((r[0], body_of(r)), (200, {"on": False, "url": None, "ip": None, "phones": 0, "error": None}))
+        self.assertEqual(run(c.respond("GET", "/api/lan?t=wrong", dict(HOST)))[0], 403)
+        r = self.pc_post("/api/lan", {"on": True})
+        self.assertEqual((r[0], body_of(r)), (200, c.lan_info()))
+        self.assertTrue(body_of(r)["url"].startswith(f"http://{LAN_IP}:{PORT}/?t="))
+        self.assertEqual(c.state()["lan"]["on"], True)
+        old = c.lan_token
+        r = self.pc_post("/api/lan", {"renew": True})
+        self.assertEqual((r[0], body_of(r)["on"]), (200, True))
+        self.assertNotEqual(c.lan_token, old)
+        self.assertEqual(body_of(r)["url"], c.lan_url)
+        for bad in ({}, {"on": "yes"}, {"renew": 1}, None):
+            self.assertEqual(self.pc_post("/api/lan", bad)[0], 400, bad)
+        r = self.pc_post("/api/lan", {"on": False})
+        self.assertEqual((r[0], body_of(r)["on"], c.state()["lan"]), (200, False, {"on": False, "phones": 0}))
+        self.assertEqual([t["on"] for t in self.told], [True, True, False])    # on, renewed, off
+        h = dict(HOST)                                      # POST: the header token only (as /api/cmd)
+        self.assertEqual(run(c.respond("POST", f"/api/lan?t={TOKEN}", h, b'{"on": true}'))[0], 403)
+        self.assertFalse(c.lan_on)
+
+    def test_phones_count_and_end(self):
+        """A phone's event stream counts in state.lan.phones (and is told); turning it off ends it at once."""
+        c = self.c
+        self.on()
+        changes = len(self.told)
+
+        async def body():
+            pc, phone = companion._Stream(False), companion._Stream(False, phone=True)
+            c._streams |= {pc, phone}
+            c._lan_changed()
+            self.assertEqual(c.state()["lan"], {"on": True, "phones": 1})
+            self.assertEqual(self.told[-1]["phones"], 1)
+            self.assertTrue(pc.state and pc.wake.is_set())   # (the PC's page shows the count: a state change)
+            c._lan_changed()                                 # (nothing new: not told again)
+            self.assertEqual(len(self.told), changes + 1)
+            await c.set_lan(False)
+            self.assertTrue(phone.ended and phone.wake.is_set())
+            self.assertFalse(pc.ended)
+            self.assertEqual((c.phones(), c.streams()), (0, 1))
+            self.assertEqual((self.told[-1]["on"], self.told[-1]["phones"]), (False, 0))
+            self.assertEqual(len(self.told), changes + 2)    # (one change: off and the phones gone together)
+        run(body())
+
+    def test_on_lan_change_failure_is_logged(self):
+        def boom():
+            raise ConnectionResetError("gone")
+        self.c.on_lan_change = boom
+        with self.assertLogs("earthd.companion", "ERROR"):
+            self.assertTrue(run(self.c.set_lan(True))["on"])
+
+
+class QrCodeCopyTest(unittest.TestCase):
+    def test_byte_identical_to_the_mods(self):
+        root = Path(__file__).resolve().parents[2]
+        ours = (root / "server" / "companion_web" / "qrcode.js").read_bytes()
+        mods = (root / "mod" / "beamng_earth" / "ui" / "ui-vue" / "mods" / "beamngEarth" / "qrcode.js").read_bytes()
+        self.assertEqual(ours, mods, "server/companion_web/qrcode.js must be a byte-identical copy of the mod's")
+        self.assertEqual(companion.STATIC["/qrcode.js"], ("qrcode.js", "text/javascript; charset=utf-8"))
+        c = companion.Companion(tempfile.gettempdir(), token=TOKEN)
+        c.port = PORT
+        st, ctype, body = run(c.respond("GET", "/qrcode.js", dict(HOST)))
+        self.assertEqual((st, ctype, body), (200, "text/javascript; charset=utf-8", ours))
 
 
 class Http:
@@ -504,6 +859,99 @@ class SocketTest(unittest.TestCase):
         run(main())
 
 
+def free_port():
+    with companion.socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class LanSocketTest(unittest.TestCase):
+    """The phone sharing's listener on a real socket. The private-only rule refuses 127.0.0.1 (as the LAN address and
+    as a peer), so these tests serve the "LAN" on 127.0.0.1 through the test hook (Companion.is_lan) and without the
+    loopback listener (the same port on the same address would collide); the rule itself is tried at the end."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_listener(self):
+        async def main():
+            told = []
+            c = companion.Companion(self.tmp.name, os.path.join(self.tmp.name, "web"), token=TOKEN,
+                                    on_lan_change=lambda: told.append(c.lan_info()))
+            c.port = free_port()
+            c.lan_address = lambda: "127.0.0.1"
+            c.is_lan = lambda ip: True
+            http = Http(c.port)
+            try:
+                info = await c.set_lan(True)
+                self.assertTrue(info["on"], info)
+                self.assertEqual(info["url"], f"http://127.0.0.1:{c.port}/?t={c.lan_token}")
+                token = c.lan_token
+                st, _, data = await http.request("GET", f"/api/state?t={token}")
+                self.assertEqual((st, json.loads(data)["lan"]), (200, {"on": True, "phones": 0}))
+                self.assertEqual((await http.request("GET", f"/api/state?t={TOKEN}"))[0], 403)     # (the PC's)
+                st, _, data = await http.request("POST", "/api/key", {"X-BNE-Token": token}, b'{"key": ""}')
+                self.assertEqual((st, json.loads(data)["error"]), (403, "only on the PC"))
+                # a phone's event stream: counted, told, in every state
+                r, w, head = await http.stream(token)
+                self.assertIn(" 200 ", head.split("\r\n")[0])
+                first = await read_events(r, 0.3)
+                self.assertEqual(first[-1], ("state", c.state()))
+                self.assertEqual(c.state()["lan"], {"on": True, "phones": 1})
+                self.assertEqual((told[-1]["on"], told[-1]["phones"]), (True, 1))
+                # Stop sharing: the stream ends, nothing listens, the code is dead
+                lan_srv = c._lan_srv
+                await c.set_lan(False)
+                await asyncio.wait_for(r.read(), 5)     # the stream ends (read to its end: no timeout)
+                w.close()
+                self.assertEqual((told[-1]["on"], told[-1]["phones"], c.phones()), (False, 0, 0))
+                self.assertFalse(lan_srv.is_serving())
+                # on again: a new code; the old one is refused
+                await c.set_lan(True)
+                self.assertNotEqual(c.lan_token, token)
+                self.assertEqual((await http.request("GET", f"/api/state?t={token}"))[0], 403)
+                self.assertEqual((await http.request("GET", f"/api/state?t={c.lan_token}"))[0], 200)
+                # the rule for real: a loopback peer is not on the local network: closed without an answer
+                c.is_lan = companion.is_lan
+                rr, ww = await asyncio.open_connection("127.0.0.1", c.port)
+                ww.write(f"GET /api/state?t={c.lan_token} HTTP/1.1\r\nHost: 127.0.0.1:{c.port}\r\n\r\n".encode())
+                await ww.drain()
+                try:
+                    got = await asyncio.wait_for(rr.read(), 5)
+                except ConnectionResetError:        # (Windows: the unread request makes the close a reset)
+                    got = b""
+                self.assertEqual(got, b"")
+                ww.close()
+                await c.set_lan(False)
+                info = await c.set_lan(True)            # ... nor a LAN address to serve on
+                self.assertEqual((info["on"], info["error"]),
+                                 (False, "no local network address found (127.0.0.1 is a loopback address)"))
+            finally:
+                c.close()
+                await asyncio.sleep(0.05)
+        run(main())
+
+    def test_port_taken_on_that_address(self):
+        async def main():
+            c = companion.Companion(self.tmp.name, token=TOKEN)
+            srv, port = await c.start(0)                # (127.0.0.1:port is taken: by the loopback listener)
+            c.lan_address = lambda: "127.0.0.1"
+            c.is_lan = lambda ip: True
+            try:
+                info = await c.set_lan(True)
+                self.assertFalse(info["on"])
+                self.assertTrue(info["error"].startswith(f"cannot listen on 127.0.0.1:{port}: "), info["error"])
+                self.assertNotIn("attempting to bind", info["error"])
+                self.assertIsNone(c.lan_token)
+            finally:
+                c.close()
+                srv.close()
+        run(main())
+
+
 try:
     import test_server
 except ImportError as e:                            # (the server's packages missing: the glue cannot be tried)
@@ -514,14 +962,16 @@ except ImportError as e:                            # (the server's packages mis
 @unittest.skipIf(test_server is None, "earthd not importable")
 class EarthdGlueTest(test_server.ServerHarness if test_server is not None else unittest.TestCase):
     """earthd with a Companion: gps_state marks the game's connection, its poses / routes / going reach the state,
-    a command from the page reaches the mod as remote_cmd, hello is followed by companion {port}."""
+    a command from the page reaches the mod as remote_cmd, hello is followed by companion {port}, companion_lan is
+    answered with companion_lan_state (and a change goes to the game's connection)."""
 
     def setUp(self):
         super().setUp()
         import earthd
         self.earthd = earthd
         self.comp = companion.Companion(self.tmp.name, search=self.server.companion_search,
-                                        send_cmd=self.server.companion_cmd)
+                                        send_cmd=self.server.companion_cmd,
+                                        on_lan_change=self.server.companion_lan_push)
         self.comp.port = 47699
         self.server.companion = self.comp
 
@@ -586,6 +1036,44 @@ class EarthdGlueTest(test_server.ServerHarness if test_server is not None else u
         self.assertEqual((self.comp.route, self.comp.gps), ([], None))
         self.assertFalse(self.on_loop(self.server.companion_cmd, {"action": "clear_gps"}))
         self.c = test_server.Client(self.srv.sockets[0].getsockname()[1])     # (tearDown closes one)
+
+    def test_lan(self):
+        """companion_lan (the world map's Phone dialog) is answered with companion_lan_state; a change made elsewhere
+        (the PC's page) goes to the game's connection; without the live map the answer says so."""
+        comp = self.comp
+        comp.port = free_port()
+        comp.lan_address = lambda: "127.0.0.1"          # (LanSocketTest: the "LAN" on 127.0.0.1 via the test hook)
+        comp.is_lan = lambda ip: True
+        self.c.send({"type": "hello", "protocol": 4, "format": self.MOD_FORMAT, "modVersion": "0.4.0"})
+        self.c.until(lambda m: m["type"] == "companion", 10)
+        try:
+            self.c.send({"type": "companion_lan", "on": True})
+            m, _ = self.c.until(lambda m: m["type"] == "companion_lan_state", 10)
+            self.assertEqual(m, {"type": "companion_lan_state", "on": True, "url": comp.lan_url, "phones": 0,
+                                 "error": None})
+            old = m["url"]
+            self.assertTrue(old.startswith(f"http://127.0.0.1:{comp.port}/?t="))
+            self.c.send({"type": "companion_lan", "on": True, "renew": True})          # New code
+            m, _ = self.c.until(lambda m: m["type"] == "companion_lan_state", 10)
+            self.assertEqual((m["on"], m["url"]), (True, comp.lan_url))
+            self.assertNotEqual(m["url"], old)
+            # the game's connection (gps_state) is told when the PC's page stops the sharing
+            self.c.send({"type": "gps_state", "active": False})
+            self.assertTrue(self.wait(lambda: self.server.companion_conn is self.conn()))
+            asyncio.run_coroutine_threadsafe(comp.set_lan(False), self.loop).result(5)
+            m, _ = self.c.until(lambda m: m["type"] == "companion_lan_state", 10)
+            self.assertEqual(m, {"type": "companion_lan_state", "on": False, "url": None, "phones": 0,
+                                 "error": None})
+            self.c.send({"type": "companion_lan", "on": False})                         # Stop (already off)
+            m, _ = self.c.until(lambda m: m["type"] == "companion_lan_state", 10)
+            self.assertFalse(m["on"])
+        finally:
+            asyncio.run_coroutine_threadsafe(comp.set_lan(False), self.loop).result(5)
+        self.server.companion = None                    # --companion-port 0
+        self.c.send({"type": "companion_lan", "on": True})
+        m, _ = self.c.until(lambda m: m["type"] == "companion_lan_state", 10)
+        self.assertEqual(m, {"type": "companion_lan_state", "on": False, "url": None, "phones": 0,
+                             "error": "the live map is off (--companion-port 0)"})
 
     def test_search_callback(self):
         got = []

@@ -939,6 +939,7 @@ local function onMessage(msg)
     ambience.clear()
     M._trafficvisuals.session(nil, false)
     M._companionPort = nil      -- (the live map's endpoint went with its server: no Live map button)
+    M._companionLan = nil       -- (... and its sharing with phones)
     setStatus('Disconnected from companion server: ' .. tostring(msg.error))
   elseif t == 'runtime_profiler_pong' then
     require('beamngEarth/profiler').pong(msg)
@@ -985,7 +986,7 @@ local function onMessage(msg)
     M.sendGraphics()
     -- the live map in the browser (docs/COMPANION.md): its endpoint is off until this server's 'companion' (it follows
     -- hello when on); the GPS state once now (the server's page knows nothing of a destination set before)
-    M._companionPort = nil
+    M._companionPort, M._companionLan = nil, nil
     gps.share(true)
     -- the on-screen credits: this session's own follow (the attribution line until then)
     credits.clear()
@@ -1225,6 +1226,11 @@ local function onMessage(msg)
   elseif t == 'companion' then
     -- ... its endpoint is on (after hello; none when earthd runs with --companion-port 0): the map's Live map button
     M._companionPort = tonumber(msg.port)
+  elseif t == 'companion_lan_state' then
+    -- ... and its sharing with phones over the local network (the answer to companion_lan, and every change after):
+    -- kept as sent (JSON null: not a string); settings.uiCompanionLanState checks the link before the map shows it
+    M._companionLan = { on = msg.on == true, url = type(msg.url) == 'string' and msg.url or nil,
+      phones = tonumber(msg.phones) or 0, error = type(msg.error) == 'string' and msg.error or nil }
   elseif t == 'areas' then
     -- the saved areas downloaded ahead (server areas.py): the list and progress; result answers an area_add / area_cmd
     M._areas = msg
@@ -2769,6 +2775,18 @@ function M.openCompanion()
   net.send({ type = 'open_companion' })
   return true
 end
+-- The world map's Phone dialog (docs/COMPANION.md, phase 2): the live map shared over the local network on / off;
+-- renew: a new code (every phone disconnected). The answer, and every change after (the PC's page, phones coming and
+-- going), is companion_lan_state: {on, url, phones, error}. Unknown (nil) from the ask to its answer, so the dialog
+-- never shows an old link or error as the answer; nil again with the connection or a new hello.
+M._companionLan = nil
+function M.companionLan(on, renew)
+  if not net.isConnected() or not M._companionPort then return false end
+  M._companionLan = nil
+  net.send({ type = 'companion_lan', on = on and true or false, renew = renew and true or nil })
+  return true
+end
+function M.companionLanState() return M._companionLan end
 
 -- The world map's cache view (server covermap.py): what is cached in the zoom-z tiles x0..x1, y0..y1 (mode: summary,
 -- elevation, imagery, mapdata); the answer is cache_map_result. Only the newest answer is kept (M._cacheMapResults:

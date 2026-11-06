@@ -1,4 +1,4 @@
-"""The live map in the browser (the fork's Google Maps integration, phase 1; the contract: docs/COMPANION.md).
+"""The live map in the browser (the fork's Google Maps integration, phases 1 and 2; the contract: docs/COMPANION.md).
 
 A small HTTP endpoint on 127.0.0.1 (as maptiles.py's: asyncio.start_server, one request per connection, the request
 parsed by hand, no new dependencies) serves a page (server/companion_web/) that shows the player's car on a Google map
@@ -8,6 +8,7 @@ set_connected) and gives it send_cmd(dict) -> bool, which passes a command to th
 
 HTTP (GET unless said; every answer Cache-Control: no-store, never any CORS header):
   /, /index.html, /app.js, /style.css   the page's files from web_dir (404 for anything else, or while missing)
+  /qrcode.js                            the PC page's phone QR code (a byte-identical copy of the mod's qrcode.js)
   /api/state?t=                         the state (state()) as JSON
   /api/events?t=                        text/event-stream: "state" (at once, then on a change, at most 4 a second:
                                         changes in between are coalesced into the next one), "route" (at once when
@@ -15,6 +16,7 @@ HTTP (GET unless said; every answer Cache-Control: no-store, never any CORS head
   POST /api/cmd                         {"action": "gps" | "clear_gps" | "teleport" | "autodrive", ...} -> the game
   POST /api/key                         the player's Maps JavaScript API key, stored in <user dir>/google_maps_key.txt
   /api/search?t=&q=                     Photon's results (geocode.search, biased to the player)
+  /api/lan?t=, POST /api/lan            the phone over the local network: its state / {"on"} or {"renew"} (lan_info)
 
 Checks, in this order: the Host header must be 127.0.0.1:<port> or localhost:<port> (421 otherwise: a page on another
 site that rebinds its name to 127.0.0.1 would send its own name), every /api/ request must carry the token (?t= on GET:
@@ -22,16 +24,28 @@ EventSource cannot set headers; the X-BNE-Token header on POST: a custom header 
 CORS preflight, which is never answered) (403), a POST body is 4 KB at most (413). The page's files need no token
 (nothing secret in them); the token only lives in the page's URL (earthd opens it in the browser: open_companion).
 
+The phone (phase 2, off until the player asks: set_lan / renew_lan, from the game's companion_lan or the PC page's
+/api/lan): a second listener on <LAN address>:<port> (lan_address: --companion-lan-ip, else the default route's
+interface, else the host name's; private IPv4 only) with its own phone token (an old QR code dies with off / renew).
+Its requests are checked first (check()): the peer must be private IPv4 (else closed without an answer), 20 wrong
+tokens from one peer in 60 s block it (429) for 60 s, the Host must be <LAN address>:<port> (421), /api/ needs the
+phone token (the PC token is refused there, the phone token on 127.0.0.1) (403), /api/key and /api/lan are the PC's
+(403). The state's "lan" {"on", "phones"} (the phones' event streams) is everyone's; on_lan_change() tells earthd
+(companion_lan_state to the game) when it, or the phone token, changes.
+
 Everything runs on earthd's event loop (the feeds are called from the connection's message dispatch, send_cmd writes
 to the game's connection directly); only the search runs in an executor (it blocks on Photon).
 """
 import asyncio
+import collections
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
 import secrets
+import socket
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -43,7 +57,8 @@ KEY_FILE = "google_maps_key.txt"    # in the game's user folder (the player's ow
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/style.css": ("style.css", "text/css; charset=utf-8")}
+          "/style.css": ("style.css", "text/css; charset=utf-8"),
+          "/qrcode.js": ("qrcode.js", "text/javascript; charset=utf-8")}
 MAX_REQUEST = 8192              # bytes of request head accepted
 MAX_BODY = 4096                 # bytes of a POST body accepted (413 beyond)
 READ_TIMEOUT_S = 10
@@ -58,7 +73,17 @@ KEY_RE = re.compile(r"[A-Za-z0-9_-]{20,80}")
 ACTIONS = ("gps", "clear_gps", "teleport", "autodrive")
 REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
            409: "Conflict", 411: "Length Required", 413: "Payload Too Large", 421: "Misdirected Request",
-           500: "Internal Server Error", 503: "Service Unavailable"}
+           429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
+# the phone over the local network (phase 2)
+PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+ROUTE_PROBE = ("10.255.255.255", 1)     # a UDP connect() there picks the default route's interface (nothing is sent)
+WRONG_MAX = 20                  # wrong tokens from one LAN peer within WRONG_WINDOW_S: 429 for BLOCK_S beyond
+WRONG_WINDOW_S = 60.0
+BLOCK_S = 60.0
+WRONG_PEERS_MAX = 1024          # LAN peers whose wrong tokens are counted at once (the oldest forgotten beyond)
+PC_ONLY = ("/api/key", "/api/lan")      # never from the LAN listener (403 "only on the PC")
+NO_LAN = "no local network address found"
+CLOSED = (0, "", b"")           # check() / respond(): close the connection without an answer (not a LAN peer)
 
 
 class BadRequest(ValueError):
@@ -67,6 +92,10 @@ class BadRequest(ValueError):
 
 class SearchError(Exception):
     """A search that failed with a text for the page (earthd's search callback: geocode.error_text)."""
+
+
+class LanError(Exception):
+    """No LAN address to serve the phone on (lan_address; its text is the "error" of lan_info)."""
 
 
 # --- pure helpers (unit-tested without sockets) -----------------------------------------------------------------
@@ -93,6 +122,71 @@ def check_host(host, port):
     if not isinstance(host, str) or port is None:
         return False
     return host.strip().lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+
+def why_not_lan(ip):
+    """None when ip is a private IPv4 address (10/8, 172.16/12, 192.168/16: one a phone on the same network can
+    reach and the internet cannot), else why not (for the "error")."""
+    try:
+        a = ipaddress.IPv4Address(ip)
+    except (ipaddress.AddressValueError, TypeError, ValueError):
+        return "not an IPv4 address"
+    if any(a in n for n in PRIVATE_NETS):
+        return None
+    if a.is_loopback:
+        return "a loopback address"
+    if a.is_link_local:
+        return "a link-local address (no DHCP answer on that network)"
+    if a.is_unspecified:
+        return "no address"
+    return "not a private address" if a.is_private or a.is_reserved or a.is_multicast else "a public address"
+
+
+def is_lan(ip):
+    """Is ip a private IPv4 address (why_not_lan)? (A LAN listener's peer must be.)"""
+    return why_not_lan(ip) is None
+
+
+def lan_address(override=None, sock=socket):
+    """The address the phone reaches this PC on: override (--companion-lan-ip) if given, else the IPv4 address of the
+    interface with the default route (a UDP socket's connect(ROUTE_PROBE) + getsockname(): no packet is sent), else
+    the first private one of getaddrinfo(gethostname()). Private IPv4 only (why_not_lan): LanError otherwise, with
+    the address and why when there was one. sock: the socket module (the tests' fake)."""
+    if override:
+        why = why_not_lan(override)
+        if why:
+            raise LanError(f"--companion-lan-ip {override}: {why}")
+        return override
+    seen = []                           # (address, why not) of the candidates refused
+    try:
+        s = sock.socket(sock.AF_INET, sock.SOCK_DGRAM)
+        try:
+            s.connect(ROUTE_PROBE)
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        why = why_not_lan(ip)
+        if why is None:
+            return ip
+        if ip != "0.0.0.0":
+            seen.append((ip, why))
+    except OSError as e:                # (no default route: offline, cable out)
+        log.debug("live map: no default route: %s", e)
+    try:
+        infos = sock.getaddrinfo(sock.gethostname(), None, sock.AF_INET)
+    except OSError as e:
+        log.debug("live map: getaddrinfo: %s", e)
+        infos = []
+    for info in infos:
+        ip = info[4][0]
+        why = why_not_lan(ip)
+        if why is None:
+            return ip
+        if (ip, why) not in seen:
+            seen.append((ip, why))
+    if seen:
+        raise LanError(f"{NO_LAN} ({seen[0][0]} is {seen[0][1]})")
+    raise LanError(NO_LAN)
 
 
 def check_cmd(body):
@@ -132,6 +226,15 @@ def check_key(body):
     if key and not KEY_RE.fullmatch(key):
         raise BadRequest("not a Google Maps API key (20-80 letters, digits, _ or -)")
     return key
+
+
+def check_lan(body):
+    """POST /api/lan's body -> True (on), False (off) or "renew" (a new code); BadRequest for anything else."""
+    if isinstance(body, dict) and body.get("renew") is True:
+        return "renew"
+    if not isinstance(body, dict) or not isinstance(body.get("on"), bool):
+        raise BadRequest('the body must be {"on": true}, {"on": false} or {"renew": true}')
+    return body["on"]
 
 
 def gps_of(msg):
@@ -197,21 +300,25 @@ def _json(status, obj):
 
 
 class _Stream:
-    """An /api/events stream's pending work: what changed since it last wrote (flags), and the event that wakes it."""
+    """An /api/events stream's pending work: what changed since it last wrote (flags), and the event that wakes it;
+    phone: on the LAN listener (one of the state's lan.phones), ended: to stop now (the phone sharing turned off)."""
 
-    def __init__(self, route):
+    def __init__(self, route, phone=False):
         self.state = True           # the state at once ...
         self.route = route          # ... and the route when there is one
+        self.phone = phone
+        self.ended = False
         self.wake = asyncio.Event()
 
 
 class Companion:
     """The live map's HTTP endpoint and its state (module docstring). send_cmd(dict) -> bool passes a command to the
     game (False: no game connected, 409); search(q, lat, lon) -> [{"name", "detail", "lat", "lon", ...}] blocks (run
-    in executor, None: the loop's default) and raises on failure (SearchError: its text is the page's)."""
+    in executor, None: the loop's default) and raises on failure (SearchError: its text is the page's). lan_ip: the
+    --companion-lan-ip override; on_lan_change(): the phone sharing's on / phones / token changed (lan_info())."""
 
     def __init__(self, user_dir, web_dir=WEB_DIR, token=None, search=None, send_cmd=None, executor=None,
-                 clock=time.monotonic, wall=time.time):
+                 clock=time.monotonic, wall=time.time, lan_ip=None, on_lan_change=None):
         self.user_dir = user_dir
         self.web_dir = web_dir
         self.token = token or secrets.token_urlsafe(18)
@@ -230,11 +337,32 @@ class Companion:
         self.api_key = self._read_key()
         self._streams = set()
         self._closed = False
+        # the phone over the local network (set_lan): off until asked, never remembered across starts
+        self.lan_ip_override = lan_ip
+        self.on_lan_change = on_lan_change
+        self.lan_ip = None          # the LAN listener's address while on
+        self.lan_token = None       # the phone token while on (separate from the PC's)
+        self.lan_error = None       # why the last try to turn it on failed
+        self.is_lan = is_lan        # (the peer / address rule: a test hook to serve on 127.0.0.1)
+        self._lan_srv = None
+        self._lan_lock = None
+        self._lan_last = (False, 0, None)       # (on, phones, token) last told (_lan_changed)
+        self._wrong = {}            # LAN peer -> deque of its wrong tokens' times (the last WRONG_WINDOW_S)
+        self._blocked = {}          # LAN peer -> 429 until then (clock)
 
     @property
     def url(self):
         """The page with its token (what open_companion opens)."""
         return f"http://127.0.0.1:{self.port}/?t={self.token}"
+
+    @property
+    def lan_on(self):
+        return self._lan_srv is not None
+
+    @property
+    def lan_url(self):
+        """The phone's page with the phone token (the QR code), None while off."""
+        return f"http://{self.lan_ip}:{self.port}/?t={self.lan_token}" if self.lan_on else None
 
     @property
     def key_path(self):
@@ -252,7 +380,8 @@ class Companion:
     def state(self):
         """The state snapshot (/api/state, the "state" event; docs/COMPANION.md "State")."""
         return {"v": 1, "connected": self.connected, "player": self.player, "gps": self.gps,
-                "routeVersion": self.route_version, "apiKey": self.api_key}
+                "routeVersion": self.route_version, "apiKey": self.api_key,
+                "lan": {"on": self.lan_on, "phones": self.phones()}}
 
     def route_event(self):
         return {"version": self.route_version, "points": self.route}
@@ -312,10 +441,60 @@ class Companion:
         self._changed()
 
     # --- requests ---------------------------------------------------------------------------------------------------
-    def _token_ok(self, method, query, headers):
+    def _token_ok(self, method, query, headers, lan=False):
+        """The request's token is the listener's: the phone token on the LAN one (none while off), the PC's on
+        127.0.0.1 (never the other's)."""
+        want = self.lan_token if lan else self.token
         got = headers.get("x-bne-token") if method == "POST" else (query.get("t") or [""])[0]
-        return isinstance(got, str) and secrets.compare_digest(got.encode("utf-8", "replace"),
-                                                               self.token.encode("utf-8"))
+        return want is not None and isinstance(got, str) and secrets.compare_digest(
+            got.encode("utf-8", "replace"), want.encode("utf-8"))
+
+    def check(self, method, path, query, headers, lan=False, peer=None):
+        """The checks before anything else, in the contract's order (docs/COMPANION.md); None: passed, else the
+        answer (CLOSED: close without one). lan: the request came to the LAN listener, from peer (its address)."""
+        if lan:
+            if not self.is_lan(peer):               # (a VPN's, a public address forwarded in: not our network)
+                return CLOSED
+            now = self.clock()
+            if self._blocked.get(peer, -math.inf) > now:
+                return _json(429, {"ok": False, "error": "too many wrong codes: try again in a minute"})
+            host = headers.get("host")
+            if not self.lan_on or not isinstance(host, str) or host.strip() != f"{self.lan_ip}:{self.port}":
+                return 421, "text/plain; charset=utf-8", b"wrong host"
+        elif not check_host(headers.get("host"), self.port):
+            return 421, "text/plain; charset=utf-8", b"wrong host"
+        if not path.startswith("/api/"):
+            return None
+        if not self._token_ok(method, query, headers, lan):
+            if lan and self._wrong_token(peer, now):
+                return _json(429, {"ok": False, "error": "too many wrong codes: try again in a minute"})
+            return _json(403, {"ok": False, "error": "wrong or missing token"})
+        if lan and path in PC_ONLY:
+            return _json(403, {"ok": False, "error": "only on the PC"})
+        return None
+
+    def _wrong_token(self, peer, now):
+        """Counts a LAN peer's wrong token; True when that makes more than WRONG_MAX within WRONG_WINDOW_S (the peer
+        is then blocked for BLOCK_S: guessing a token from the network is too slow to ever get there)."""
+        for p in [p for p, t in self._blocked.items() if t <= now]:
+            del self._blocked[p]
+        for p in [p for p, q in self._wrong.items() if q[-1] <= now - WRONG_WINDOW_S]:
+            del self._wrong[p]
+        q = self._wrong.get(peer)
+        if q is None:
+            while len(self._wrong) >= WRONG_PEERS_MAX:          # (insertion order: the oldest peer first)
+                del self._wrong[next(iter(self._wrong))]
+            q = self._wrong[peer] = collections.deque()
+        q.append(now)
+        while q[0] <= now - WRONG_WINDOW_S:
+            q.popleft()
+        if len(q) <= WRONG_MAX:
+            return False
+        del self._wrong[peer]
+        self._blocked[peer] = now + BLOCK_S
+        log.info("live map: %s sent %d wrong phone codes within %.0f s: refused for %.0f s", peer, len(q),
+                 WRONG_WINDOW_S, BLOCK_S)
+        return True
 
     def static(self, path):
         """(status, content type, body) of one of the page's files."""
@@ -327,22 +506,24 @@ class Companion:
             return 404, "text/plain; charset=utf-8", b"not found"
         return 200, ctype, body
 
-    async def respond(self, method, target, headers, body=b""):
-        """(status, content type, body) for one request other than /api/events (no sockets: the tests call it)."""
+    async def respond(self, method, target, headers, body=b"", lan=False, peer=None):
+        """(status, content type, body) for one request other than /api/events (no sockets: the tests call it); lan:
+        it came to the LAN listener from peer (check()). CLOSED: close the connection without an answer."""
         parts = urlsplit(target)
         path, query = parts.path, parse_qs(parts.query)
-        if not check_host(headers.get("host"), self.port):
-            return 421, "text/plain; charset=utf-8", b"wrong host"
+        bad = self.check(method, path, query, headers, lan, peer)
+        if bad is not None:
+            return bad
         if path in STATIC:
             if method not in ("GET", "HEAD"):
                 return 405, "text/plain; charset=utf-8", b"GET only"
             return self.static(path)
         if not path.startswith("/api/"):
             return 404, "text/plain; charset=utf-8", b"not found"
-        if not self._token_ok(method, query, headers):
-            return _json(403, {"ok": False, "error": "wrong or missing token"})
+        if path == "/api/lan" and method in ("GET", "HEAD"):     # (GET and POST: the PC's Phone box)
+            return _json(200, self.lan_info())
         want = {"/api/state": "GET", "/api/events": "GET", "/api/search": "GET", "/api/cmd": "POST",
-                "/api/key": "POST"}.get(path)
+                "/api/key": "POST", "/api/lan": "POST"}.get(path)
         if want is None:
             return 404, "text/plain; charset=utf-8", b"not found"
         if method != want and not (want == "GET" and method == "HEAD"):
@@ -360,10 +541,14 @@ class Companion:
         try:
             if path == "/api/cmd":
                 cmd = check_cmd(data)
+            elif path == "/api/lan":
+                lan_on = check_lan(data)
             else:
                 key = check_key(data)
         except BadRequest as e:
             return _json(400, {"ok": False, "error": str(e)})
+        if path == "/api/lan":
+            return _json(200, await (self.renew_lan() if lan_on == "renew" else self.set_lan(lan_on)))
         if path == "/api/cmd":
             ok = False
             if self.connected and self.send_cmd is not None:
@@ -424,7 +609,14 @@ class Companion:
         return _json(200, {"results": out})
 
     # --- the socket side --------------------------------------------------------------------------------------------
-    async def handle(self, reader, writer):
+    async def handle(self, reader, writer, lan=False):
+        """One connection (one request, or an event stream); lan: it came to the LAN listener."""
+        peer = None
+        if lan:
+            peer = (writer.get_extra_info("peername") or (None,))[0]
+            if not self.is_lan(peer):           # (check()'s first rule, before reading anything)
+                writer.close()
+                return
         try:
             try:
                 head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), READ_TIMEOUT_S)
@@ -448,15 +640,20 @@ class Companion:
                     body = await asyncio.wait_for(reader.readexactly(n), READ_TIMEOUT_S) if n else b""
                 except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
                     return
-            if urlsplit(target).path == "/api/events" and method == "GET" and check_host(headers.get("host"),
-                                                                                         self.port):
-                if self._token_ok(method, parse_qs(urlsplit(target).query), headers):
-                    return await self._events(reader, writer)
-            try:
-                status, ctype, out = await self.respond(method, target, headers, body)
-            except Exception as e:      # never take the endpoint down for one request
-                log.exception("live map %s %s failed", method, urlsplit(target).path)
-                status, ctype, out = 500, "text/plain; charset=utf-8", str(e).encode("utf-8", "replace")
+            parts = urlsplit(target)
+            if parts.path == "/api/events" and method == "GET":     # (checked here: respond() never sees it)
+                bad = self.check(method, parts.path, parse_qs(parts.query), headers, lan, peer)
+                if bad is None:
+                    return await self._events(reader, writer, phone=lan)
+                status, ctype, out = bad
+            else:
+                try:
+                    status, ctype, out = await self.respond(method, target, headers, body, lan, peer)
+                except Exception as e:      # never take the endpoint down for one request
+                    log.exception("live map %s %s failed", method, parts.path)
+                    status, ctype, out = 500, "text/plain; charset=utf-8", str(e).encode("utf-8", "replace")
+            if (status, ctype, out) == CLOSED:
+                return
             extra = ("Referrer-Policy: strict-origin-when-cross-origin",) if ctype.startswith("text/html") else ()
             data = response(status, ctype, out, extra)
             if method == "HEAD":
@@ -473,12 +670,15 @@ class Companion:
         except ConnectionError:
             pass
 
-    async def _events(self, reader, writer):
-        """One /api/events stream until the browser goes (its socket's end) or close()."""
+    async def _events(self, reader, writer, phone=False):
+        """One /api/events stream until the browser goes (its socket's end) or close(); phone: on the LAN listener
+        (counted in the state's lan.phones; ended when the sharing is turned off or renewed)."""
         if len(self._streams) >= MAX_STREAMS or self._closed:
             return await self._write(writer, response(*_json(503, {"ok": False, "error": "too many live maps open"})))
-        st = _Stream(self.route_version > 0)
+        st = _Stream(self.route_version > 0, phone)
         self._streams.add(st)
+        if phone:
+            self._lan_changed()
         eof = asyncio.ensure_future(reader.read(1))     # the browser closed the page (or sent more: not HTTP/1.1 here)
         try:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
@@ -486,7 +686,7 @@ class Companion:
                          b"retry: 2000\n\n")
             await writer.drain()
             last_state, last_write = -1e18, self.clock()
-            while not eof.done() and not self._closed:
+            while not eof.done() and not self._closed and not st.ended:
                 now = self.clock()
                 state_due = st.state and now - last_state >= self.state_gap_s
                 ping_due = now - last_write >= self.ping_s
@@ -515,12 +715,19 @@ class Companion:
         except ConnectionError:
             pass
         finally:
+            gone = st in self._streams          # (a phone's stream ended by _lan_off is out already)
             self._streams.discard(st)
             eof.cancel()
+            if phone and gone:
+                self._lan_changed()
 
     def streams(self):
         """The /api/events streams open now."""
         return len(self._streams)
+
+    def phones(self):
+        """The phones' (the LAN listener's) event streams open now."""
+        return sum(1 for st in self._streams if st.phone)
 
     async def start(self, port=DEFAULT_PORT, host="127.0.0.1"):
         """The HTTP server on host:port (0: any free port); returns (asyncio server, port)."""
@@ -529,7 +736,88 @@ class Companion:
         return srv, self.port
 
     def close(self):
-        """Ends the open streams (the server's own close() does not end its handlers)."""
+        """Ends the open streams (the server's own close() does not end its handlers) and the phone sharing."""
         self._closed = True
+        self._lan_off()
         for st in self._streams:
             st.wake.set()
+
+    # --- the phone over the local network (phase 2) ---------------------------------------------------------------
+    def lan_info(self):
+        """GET /api/lan's answer (and companion_lan_state's fields): {"on", "url", "ip", "phones", "error"}."""
+        return {"on": self.lan_on, "url": self.lan_url, "ip": self.lan_ip if self.lan_on else None,
+                "phones": self.phones(), "error": self.lan_error}
+
+    def lan_address(self):
+        """The address to serve the phone on (lan_address with the --companion-lan-ip override; LanError)."""
+        return lan_address(self.lan_ip_override)
+
+    async def set_lan(self, on):
+        """Turns the phone sharing on (a LAN listener on <lan_address()>:<port> and a new phone token; idempotent
+        while on) or off (the listener closed, the phones' streams ended, the token dropped: an old QR code dies);
+        returns lan_info() (error set and on false when turning it on failed)."""
+        return await self._set_lan(bool(on))
+
+    async def renew_lan(self):
+        """A new code: off then on (a new phone token, every phone disconnected; told once); returns lan_info()."""
+        return await self._set_lan(True, renew=True)
+
+    async def _set_lan(self, on, renew=False):
+        if self._lan_lock is None:
+            self._lan_lock = asyncio.Lock()
+        async with self._lan_lock:          # (the game's dialog and the PC's page at once: one listener)
+            if not on or renew:
+                self._lan_off()
+            if on and not self.lan_on:
+                await self._lan_on()
+            self._lan_changed()
+            return self.lan_info()
+
+    async def _lan_on(self):
+        if self._closed or self.port is None:
+            self.lan_error = "the live map is off"
+            return
+        try:
+            ip = self.lan_address()
+            if not self.is_lan(ip):         # (an injected lan_address: the same rule)
+                raise LanError(f"{NO_LAN} ({ip} is {why_not_lan(ip)})")
+        except LanError as e:
+            self.lan_error = str(e)
+            log.warning("live map: no phone sharing: %s", e)
+            return
+        try:
+            srv = await asyncio.start_server(lambda r, w: self.handle(r, w, lan=True), ip, self.port,
+                                             limit=MAX_REQUEST)
+        except OSError as e:                # the port taken on that address, the address gone
+            why = re.sub(r"^error while attempting to bind on address \(.*?\): ", "", str(e.strerror or e))
+            self.lan_error = f"cannot listen on {ip}:{self.port}: {why}"    # (asyncio's own prefix dropped)
+            log.warning("live map: no phone sharing: %s", self.lan_error)
+            return
+        self._lan_srv, self.lan_ip, self.lan_token, self.lan_error = srv, ip, secrets.token_urlsafe(18), None
+        log.info("live map: phones on http://%s:%d/ (the QR code's link)", ip, self.port)    # (never the token)
+
+    def _lan_off(self):
+        """The LAN listener closed, the phones' streams ended (out of phones() at once), the phone token dropped."""
+        srv, self._lan_srv = self._lan_srv, None
+        self.lan_ip = self.lan_token = None
+        for st in [st for st in self._streams if st.phone]:
+            self._streams.discard(st)
+            st.ended = True
+            st.wake.set()
+        if srv is not None:
+            srv.close()                     # (stops listening now; a request being answered still finishes)
+            log.info("live map: phone sharing off")
+
+    def _lan_changed(self):
+        """The phone sharing's on / phones / token may have changed: if so, the state goes to every stream (lan) and
+        earthd is told (on_lan_change: companion_lan_state to the game)."""
+        now = (self.lan_on, self.phones(), self.lan_token)
+        if now == self._lan_last:
+            return
+        self._lan_last = now
+        self._changed()
+        if self.on_lan_change is not None:
+            try:
+                self.on_lan_change()
+            except Exception:               # (the game's connection closing under it)
+                log.exception("live map: on_lan_change failed")

@@ -10,8 +10,8 @@ Status: beta (see VERSION). Tested on BeamNG.drive 0.40.4 on Linux (Vulkan) and 
 **This fork** of [TecnaGamer/BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth) adds a Google Maps integration
 to the world map: open a spot, its Street View or your GPS route in Google Maps, send them to your phone as a QR code,
 and paste your phone's Google Maps share links into the map; a **live map** page shows your car on Google Maps in
-your browser (a second monitor) with your own Maps JavaScript API key. Nothing of Google's is drawn in the game; see
-"Map and navigation" below.
+your browser (a second monitor) or on your phone (scan a QR code) with your own Maps JavaScript API key. Nothing of
+Google's is drawn in the game; see "Map and navigation" below.
 
 **Community:** join the TGForever Discord, **[discord.gg/tgf](https://discord.gg/tgf)**, and head to the
 #beamng-earth channel to chat about the mod, get help, report bugs, help with its development, and get an IP to join a
@@ -175,6 +175,11 @@ You can help support development by reporting [issues](https://github.com/TecnaG
   your own Google Maps JavaScript API key (pasted on the page; without one Google shows a dimmed "for development
   purposes only" map); restrict the key to the Maps JavaScript API and to `http://127.0.0.1:47616/*`. The page is
   served by the world server on this PC only (127.0.0.1, with a random token); see [docs/COMPANION.md](docs/COMPANION.md).
+  **Phone** (next to Live map, and on the live map page) shares the same map with your phone over your home network:
+  scan the QR code with the phone's camera (Android or iPhone, nothing to install). It is off until you press it, the
+  phone gets its own code (**New code** disconnects every phone, **Stop sharing** turns it off) and cannot change your
+  key. Windows may ask to allow the app through the firewall: allow it on private networks. With your own key, also
+  add the phone address the page shows (`http://192.168.x.x:47616/*`) to the key's website restrictions.
 - In multiplayer the map has a **Players** list: follow a player, show everyone, or set the GPS to them. Teleport
   works without a car too (the free camera goes there).
 - **Autodrive**: the car drives itself along the GPS route (in lane, legal speed, minding traffic).

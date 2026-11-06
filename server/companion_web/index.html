@@ -2,11 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport-fit=cover: a phone's notch / home bar are kept clear with env(safe-area-inset-*) in style.css -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <!-- the page's own URL holds the token (?t=): never send more than the origin as a referrer (Google's key
      website restriction only needs the origin) -->
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#1b2027">
 <title>BeamNG.Earth - Live map</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -23,7 +25,7 @@
   </div>
   <div id="searchBox" class="box">
     <input id="search" type="search" placeholder="Search places" autocomplete="off" spellcheck="false"
-           aria-label="Search places" aria-controls="results">
+           aria-label="Search places" aria-controls="results" enterkeyhint="search">
     <ul id="results" role="listbox" hidden></ul>
     <div class="credit">Search: Photon by komoot, &copy; OpenStreetMap contributors</div>
   </div>
@@ -32,6 +34,7 @@
     <button id="centreBtn" type="button" title="Centre the map on the car">Re-centre</button>
     <button id="autodriveBtn" type="button" class="toggle" aria-pressed="false" disabled>Autodrive off</button>
     <button id="clearBtn" type="button" disabled>Clear GPS</button>
+    <button id="phoneBtn" type="button" class="toggle" title="Open this map on your phone (a QR code)" hidden>Phone</button>
   </div>
 </header>
 <div id="status" hidden></div>
@@ -44,11 +47,13 @@
       <button id="keyHide" type="button" class="link" title="Hide this box">Hide</button>
     </div>
     <p id="keyLead">Without a key Google shows a dimmed "for development purposes only" map. Paste your own key to get the full map.</p>
-    <ol>
+    <ol id="keySteps">
       <li>In <a href="https://console.cloud.google.com/google/maps-apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud</a>, enable the <b>Maps JavaScript API</b> and create an API key.</li>
-      <li>Restrict the key: API restriction <b>Maps JavaScript API</b>; application restriction <b>Websites</b>: <code id="keySite">http://127.0.0.1:47616/*</code></li>
+      <li>Restrict the key: API restriction <b>Maps JavaScript API</b>; application restriction <b>Websites</b>: <code class="keysite"></code></li>
       <li>Paste it here.</li>
     </ol>
+    <!-- a phone: the key is set on the PC; only the phone's own address must be allowed too -->
+    <p id="keyPhone" hidden>In <a href="https://console.cloud.google.com/google/maps-apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud</a>, add <code class="keysite"></code> to the key's <b>Websites</b> restrictions: the phone opens the map at another address than the PC.</p>
     <form id="keyForm">
       <input id="keyInput" type="text" placeholder="AIza..." autocomplete="off" spellcheck="false" aria-label="API key">
       <button type="submit">Save key</button>
@@ -57,6 +62,26 @@
     <p id="keyStored" hidden>A key is stored. <button id="keyRemove" type="button" class="link">Remove the key</button></p>
   </div>
   <button id="keyShow" type="button" class="card small" hidden>Google Maps key</button>
+  <!-- the PC's Phone button: sharing over the local network (POST /api/lan) and the phone URL as a QR code -->
+  <div id="lanBox" class="card" role="dialog" aria-labelledby="lanTitle" hidden>
+    <div class="cardhead"><strong id="lanTitle">Live map on your phone</strong></div>
+    <p class="lanlead">Scan the code with the phone's camera: it opens this map in the phone's browser (nothing to install).</p>
+    <div id="lanQr" class="qr" hidden></div>
+    <div id="lanUrl" class="lanurl" hidden></div>
+    <div id="lanInfo" class="laninfo" role="status" aria-live="polite"></div>
+    <div id="lanError" class="error" hidden></div>
+    <div class="lanbtns">
+      <button id="lanRenew" type="button" title="A new code: the old one stops working and every phone is disconnected">New code</button>
+      <button id="lanStop" type="button" title="Nothing listens on the local network any more">Stop sharing</button>
+      <button id="lanClose" type="button" title="Hide this box (sharing stays on)">Close</button>
+    </div>
+    <ul class="lanhints">
+      <li>The phone must be on the same Wi-Fi / network as this PC.</li>
+      <li>Windows may ask to allow the world server through the firewall the first time: allow it on <b>private</b> networks. A network set to <b>Public</b> blocks phones.</li>
+      <li>The link is plain HTTP on your own network: use it at home, not on public Wi-Fi.</li>
+      <li id="lanKeyHint" hidden>Your Google Maps key: add <code id="lanSite"></code> to its website restrictions too.</li>
+    </ul>
+  </div>
   <div id="toast" role="status" aria-live="polite" hidden></div>
 </main>
 <script src="app.js"></script>
