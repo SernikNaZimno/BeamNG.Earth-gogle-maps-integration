@@ -162,7 +162,8 @@ is the Google Maps Platform EEA terms (since 2025-07-08): Google Maps content ma
 non-Google maps, and Street View and 3D tiles are blocked for EEA projects. Phase 1 (built): a
 web page served by the companion with the Google Maps JavaScript API (the user's own key) showing
 the car live on the PC, our own data only (docs/COMPANION.md). Phase 2 (built): the same page on
-a phone over the LAN, paired by QR code.
+a phone over the LAN, paired by QR code. Phase 3 (built): the page needs no key: MapLibre GL JS
+(bundled) with OpenFreeMap's street map or the companion's own map tiles; Google is optional.
 
 ## Roadmap
 0. **Probes** (via MCP `run_lua`): sandbox state, IPC round-trip, `createMesh`
@@ -830,6 +831,10 @@ Maps URLs: no key, nothing of Google's on our map, Google Maps itself opened out
   127.0.0.1:47616 (token, Host check, SSE for the state and the route, `/api/cmd` -> `remote_cmd` to the game, run by
   the mod's `remote.lua`); the mod sends `gps_state`. The contract is docs/COMPANION.md. Tests:
   `server/tests/test_companion.py`, `mod/tests/test_remote.lua`.
+- Phase 3, no key (branch feature/keyless-live-map): the page's default renderer is MapLibre GL JS 4.7.1
+  (`server/companion_web/vendor/maplibre-gl/`); base maps `streets` (OpenFreeMap liberty, fetched by the browser),
+  `satellite` / `terrain` (`/api/tiles/{sat|map|labels}/z/x/y` from `MapTiles.layer_tile`, 6 at once, cached an hour
+  by the browser); Google Maps only with a stored key, loaded lazily behind the same renderer interface.
 - Phase 2, the phone (branch feature/google-maps-phase2): on request (`companion_lan` from the map's Phone dialog, or
   `POST /api/lan` from the PC page) the companion also listens on the PC's private LAN address (same port) with a
   separate phone token; private peers only, a 429 for token guessing, no key changes from phones. The page lays itself

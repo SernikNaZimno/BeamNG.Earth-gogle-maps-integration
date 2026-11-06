@@ -740,10 +740,12 @@ key's website restriction names), as `maptiles.py`'s (raw asyncio, one request p
 
 - `GET /`, `/index.html`, `/app.js`, `/style.css`, `/qrcode.js`: the page's files (no token; 404 for any other name
   or while the folder is missing; `qrcode.js` is a byte-identical copy of the mod's `ui-vue/mods/beamngEarth/qrcode.js`,
-  checked by `test_companion`);
+  checked by `test_companion`); `/vendor/maplibre-gl/maplibre-gl.js`, `maplibre-gl.css`, `LICENSE.txt`: MapLibre GL
+  JS 4.7.1 (BSD-3), the keyless map's renderer (phase 3), bundled unchanged from the npm package's `dist/`;
 - `GET /api/state?t=`: `{"v":1,"connected","player":{"lat","lon","heading","speed","t"},"gps":{"lat","lon","name",
-  "autodrive","remaining","eta"},"routeVersion","apiKey","lan":{"on","phones"}}` (heading in compass degrees from
-  the pose's `vx`, `vy` while faster than 1 m/s, else the last);
+  "autodrive","remaining","eta"},"routeVersion","apiKey","lan":{"on","phones"},"tiles"}` (heading in compass degrees
+  from the pose's `vx`, `vy` while faster than 1 m/s, else the last; `tiles`: the server has map tiles, so the page
+  offers its satellite and terrain base maps);
 - `GET /api/events?t=`: server-sent events, `state` at once and on a change (at most 4 a second, changes in between
   coalesced), `route` (`{"version","points"}`) at once when there is one and on every new one, `: ping` every 15 s;
   8 streams at most (503);
@@ -752,13 +754,21 @@ key's website restriction names), as `maptiles.py`'s (raw asyncio, one request p
   (`""` deletes it); `GET /api/search?t=&q=`: `geocode.search` biased to the car (`Server.companion_search`, the UI
   pool);
 - `GET /api/lan?t=`, `POST /api/lan` (`{"on": true}`, `{"on": false}`, `{"renew": true}`): the phone sharing's
-  `{"on","url","ip","phones","error"}` (200, also when turning it on failed: `on` false, `error` set).
+  `{"on","url","ip","phones","error"}` (200, also when turning it on failed: `on` false, `error` set);
+- `GET /api/tiles/{layer}/{z}/{x}/{y}?t=` (phase 3, the keyless map's `satellite` / `terrain` base maps; no file
+  extension): `layer` `sat`, `map` or `labels` (the world map's layers), `z`/`x`/`y` checked by
+  `maptiles.check_tile`; `image/jpeg` (`image/png` for `labels`) from earthd's `MapTiles.layer_tile`
+  (`server.map_tiles`, handed to the `Companion` as `tiles`), fetched in a pool of their own, 6 at once (more wait);
+  `Cache-Control: private, max-age=3600` (a served tile's only); 404 where there is no tile or without map tiles
+  (`--map-tiles off`, no imagery), 503 when the fetch failed (retry later);
+- `GET /api/attribution?t=`: `{"attribution": "..."}` (`MapTiles.attribution()`, `""` without map tiles).
 
 Every `/api/` request needs the token earthd makes at start (`?t=` on GET, the `X-BNE-Token` header on POST: 403),
 every request a `Host` of `127.0.0.1:<port>` / `localhost:<port>` (421: DNS rebinding); POST bodies 4 KB at most
-(413); `Cache-Control: no-store` always, never a CORS header. earthd feeds it from the game's connection (the last
-one that sent `gps_state`): its poses (`update_pose`), its `gps_state` (`set_gps`), its planned routes (`set_route`),
-and its going (`set_connected(False)`: the destination and route cleared, the car's last position kept).
+(413); `Cache-Control: no-store` always (but a served tile's), never a CORS header. earthd feeds it from the
+game's connection (the last one that sent `gps_state`): its poses (`update_pose`), its `gps_state` (`set_gps`), its
+planned routes (`set_route`), and its going (`set_connected(False)`: the destination and route cleared, the car's last
+position kept).
 
 **The phone over the local network** (phase 2; off by default, never remembered across starts): `set_lan(True)`
 picks the LAN address (`lan_address`: `--companion-lan-ip`, else the default route's interface by a UDP
@@ -871,7 +881,9 @@ after hello, `companion_lan` answered with `companion_lan_state`); the phone sha
 socket module), the LAN listener's checks in order through `respond(lan=True, peer=...)` (the peer, the 429 rule on
 a fake clock, the Host, the tokens kept apart, the PC-only endpoints), `/api/lan`, `state.lan`, on / off / renew (the
 old code dead), the listener on a real socket (served on 127.0.0.1 through the `is_lan` test hook) and `qrcode.js`
-byte-identical to the mod's.
+byte-identical to the mod's; the keyless map: the tile route (a fake `MapTiles`: types, the cache header over a
+socket, bad layers and paths, 404 / 503 / 500, the tokens on both listeners, at most 6 fetches at once),
+`/api/attribution`, `state.tiles` and the bundled MapLibre files.
 `test_maplinks.py` (no network: a scripted fake transport): Google Maps short and long links told apart (look-alike
 hosts, bad characters and over-long links refused), one redirect resolved without fetching the long link, a
 `goo.gl/maps` → `maps.app.goo.gl` chain and an EU consent redirect read for its `continue`, loops, redirects off the

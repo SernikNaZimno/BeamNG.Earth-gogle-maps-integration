@@ -2,14 +2,18 @@
 request handler without sockets, the real endpoint over sockets (the event stream: framing, coalescing, pings, the
 stream cap, clean-up), the phone over the local network (the LAN address, the LAN listener's checks in order, the
 429 rule, the tokens kept apart, /api/lan, state.lan, on / off / renew, its listener on a socket, qrcode.js the mod's
-copy) and earthd's glue (gps_state marks the game's connection, its poses / routes reach the state, the page's
-commands reach the mod as remote_cmd, hello is followed by "companion", companion_lan -> companion_lan_state)."""
+copy), the keyless map (phase 3: the tile route's checks, types, errors and cache header, at most TILES_AT_ONCE
+fetches at once, /api/attribution, state.tiles, the bundled MapLibre files) and earthd's glue (gps_state marks the
+game's connection, its poses / routes reach the state, the page's commands reach the mod as remote_cmd, hello is
+followed by "companion", companion_lan -> companion_lan_state)."""
 import asyncio
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -134,7 +138,7 @@ class FeedsTest(unittest.TestCase):
     def test_state_shape(self):
         c = self.c
         self.assertEqual(c.state(), {"v": 1, "connected": False, "player": None, "gps": None, "routeVersion": 0,
-                                     "apiKey": "", "lan": {"on": False, "phones": 0}})
+                                     "apiKey": "", "lan": {"on": False, "phones": 0}, "tiles": False})
         c.set_connected(True)
         c.update_pose(50.06, 19.94, 13.4, 0.0, 13.4)
         c.set_gps({"active": True, "lat": 52.23, "lon": 21.01, "name": "Warsaw", "autodrive": False,
@@ -145,7 +149,7 @@ class FeedsTest(unittest.TestCase):
                              "player": {"lat": 50.06, "lon": 19.94, "heading": 90.0, "speed": 13.4, "t": 1793900000.0},
                              "gps": {"lat": 52.23, "lon": 21.01, "name": "Warsaw", "autodrive": False,
                                      "remaining": 254000.0, "eta": 9800.0},
-                             "routeVersion": 1, "apiKey": "", "lan": {"on": False, "phones": 0}})
+                             "routeVersion": 1, "apiKey": "", "lan": {"on": False, "phones": 0}, "tiles": False})
         self.assertEqual(c.url, f"http://127.0.0.1:{PORT}/?t={TOKEN}")
 
     def test_pose(self):
@@ -659,6 +663,26 @@ class LanRespondTest(unittest.TestCase):
         with self.assertLogs("earthd.companion", "ERROR"):
             self.assertTrue(run(self.c.set_lan(True))["on"])
 
+    def test_tiles_for_phones(self):
+        """The tiles and the attribution on the LAN listener (a phone's satellite map): the phone token, not
+        the PC's; wrong codes there count for the 429 rule too."""
+        self.c.tiles = FakeMapTiles()
+        self.addCleanup(self.c.close)
+        token = self.on()
+        self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t={token}"), (200, "image/jpeg", JPEG))
+        self.assertEqual(body_of(self.lan("GET", f"/api/attribution?t={token}"))["attribution"],
+                         "Imagery: Sentinel-2 cloudless by EOX")
+        self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t={TOKEN}")[0], 403)     # the PC's token: not here
+        self.assertEqual(self.lan("GET", "/api/tiles/sat/1/1/1")[0], 403)
+        self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t={token}", headers=HOST)[0], 421)
+        self.assertEqual(run(self.c.respond("GET", f"/api/tiles/sat/1/1/1?t={token}", dict(HOST)))[0], 403)
+        self.assertEqual(run(self.c.respond("GET", f"/api/tiles/sat/1/1/1?t={TOKEN}", dict(HOST)))[0], 200)
+        for i in range(18):                                 # wrong codes on tiles count for the 429 rule too
+            self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t=old{i}")[0], 403, i)   # (20 with the 2 above)
+        self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t={token}")[0], 200)
+        self.assertEqual(self.lan("GET", "/api/tiles/sat/1/1/1?t=old21")[0], 429)
+        self.assertEqual(self.lan("GET", f"/api/tiles/sat/1/1/1?t={token}")[0], 429)
+
 
 class QrCodeCopyTest(unittest.TestCase):
     def test_byte_identical_to_the_mods(self):
@@ -949,6 +973,216 @@ class LanSocketTest(unittest.TestCase):
             finally:
                 c.close()
                 srv.close()
+        run(main())
+
+
+JPEG = b"\xff\xd8\xff\xe0 a sat tile"
+PNG = b"\x89PNG\r\n\x1a\n a labels tile"
+
+
+class FakeMapTiles:
+    """maptiles.MapTiles as the live map uses it: layer_tile(layer, z, x, y) -> bytes / None / raises (got: a
+    (layer, z, x, y) -> result or exception table; anything else: JPEG, PNG for labels), attribution()."""
+
+    def __init__(self, got=None, credit="Imagery: Sentinel-2 cloudless by EOX"):
+        self.got, self.credit, self.calls = dict(got or {}), credit, []
+
+    def layer_tile(self, layer, z, x, y):
+        self.calls.append((layer, z, x, y))
+        r = self.got.get((layer, z, x, y), PNG if layer == "labels" else JPEG)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    def attribution(self):
+        if isinstance(self.credit, Exception):
+            raise self.credit
+        return self.credit
+
+
+class TilesTest(unittest.TestCase):
+    """The keyless map's server side (phase 3): /api/tiles, /api/attribution, state.tiles, without sockets."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mt = FakeMapTiles({("sat", 3, 4, 5): None,
+                                ("map", 14, 1, 2): companion.imagerymod.ImageryError("EOX down"),
+                                ("sat", 2, 1, 1): ZeroDivisionError("a bug")})
+        self.c = make(self.tmp.name, tiles=self.mt)
+
+    def tearDown(self):
+        self.c.close()
+        self.tmp.cleanup()
+
+    def get(self, target, headers=HOST, method="GET"):
+        return run(self.c.respond(method, target, dict(headers)))
+
+    def test_served(self):
+        self.assertEqual(self.get(f"/api/tiles/sat/0/0/0?t={TOKEN}"), (200, "image/jpeg", JPEG))
+        self.assertEqual(self.get(f"/api/tiles/map/18/262143/0?t={TOKEN}"), (200, "image/jpeg", JPEG))
+        self.assertEqual(self.get(f"/api/tiles/labels/5/31/7?t={TOKEN}"), (200, "image/png", PNG))
+        self.assertEqual(self.get(f"/api/tiles/sat/2/03/1?t={TOKEN}", method="HEAD")[:2], (200, "image/jpeg"))
+        self.assertEqual(self.mt.calls, [("sat", 0, 0, 0), ("map", 18, 262143, 0), ("labels", 5, 31, 7),
+                                         ("sat", 2, 3, 1)])
+        self.assertEqual(self.get("/api/tiles/sat/0/0/0", dict(HOST, **{"x-bne-token": TOKEN}), "POST")[0], 405)
+
+    def test_cache_header(self):
+        cache = companion.cache_of
+        self.assertEqual(cache("/api/tiles/sat/0/0/0", 200), "private, max-age=3600")
+        for path, st in (("/api/tiles/sat/0/0/0", 404), ("/api/tiles/sat/0/0/0", 503), ("/api/state", 200),
+                         ("/", 200), ("/vendor/maplibre-gl/maplibre-gl.js", 200), ("/api/attribution", 200)):
+            self.assertEqual(cache(path, st), "no-store", (path, st))
+
+    def test_bad_paths(self):
+        for path in ("/api/tiles/roads/1/0/0", "/api/tiles/SAT/1/0/0", "/api/tiles/sat/19/0/0",
+                     "/api/tiles/sat/1/2/0", "/api/tiles/sat/1/0/2", "/api/tiles/sat/1/0/-1",
+                     "/api/tiles/sat/1/0/0.jpg", "/api/tiles/labels/1/0/0.png", "/api/tiles/sat/a/0/0",
+                     "/api/tiles/sat/1/0", "/api/tiles/sat/1/0/0/0", "/api/tiles/sat/1/0/0/",
+                     "/api/tiles/sat/1/0/%30", "/api/tiles/sat/1/0/١", "/api/tiles/sat/1/0/1e1",
+                     "/api/tiles/sat/1/0/0000001", "/api/tiles/", "/api/tiles"):
+            st, ctype, _ = self.get(f"{path}?t={TOKEN}")
+            self.assertEqual((st, ctype.split(";")[0]), (404, "text/plain"), path)
+        self.assertEqual(self.mt.calls, [])                 # (never asked)
+        self.assertIsNone(companion.parse_tile("/api/tiles/sat/1/1/1.jpg"))
+        self.assertEqual(companion.parse_tile("/api/tiles/labels/1/1/0"), ("labels", 1, 1, 0))
+
+    def test_missing_and_failures(self):
+        self.assertEqual(self.get(f"/api/tiles/sat/3/4/5?t={TOKEN}")[0], 404)          # no tile there
+        st, _, body = self.get(f"/api/tiles/map/14/1/2?t={TOKEN}")
+        self.assertEqual((st, body), (503, b"EOX down"))                              # the fetch failed
+        with self.assertLogs("earthd.companion", "ERROR"):
+            self.assertEqual(self.get(f"/api/tiles/sat/2/1/1?t={TOKEN}")[0], 500)     # a bug: logged, not fatal
+        self.assertEqual(self.get(f"/api/tiles/sat/0/0/0?t={TOKEN}")[0], 200)         # (the next one still served)
+        self.c.tiles = None                                 # --map-tiles off / no imagery
+        st, _, body = self.get(f"/api/tiles/sat/0/0/0?t={TOKEN}")
+        self.assertEqual((st, body), (404, b"no map tiles on this server"))
+        self.c.close()                                      # (the server stopping: refused, not raised)
+        self.c.tiles = self.mt
+        self.assertEqual(self.get(f"/api/tiles/sat/0/0/0?t={TOKEN}")[0], 503)
+
+    def test_token_and_host(self):
+        self.assertEqual(self.get("/api/tiles/sat/0/0/0")[0], 403)
+        self.assertEqual(self.get("/api/tiles/sat/0/0/0?t=wrong")[0], 403)
+        self.assertEqual(self.get("/api/tiles/roads/0/0/0")[0], 403)          # (the token before the path)
+        self.assertEqual(self.get(f"/api/tiles/sat/0/0/0?t={TOKEN}", {"host": "evil.example:47616"})[0], 421)
+        self.assertEqual(self.get("/api/attribution")[0], 403)
+        self.assertEqual(self.mt.calls, [])
+
+    def test_attribution_and_state(self):
+        r = self.get(f"/api/attribution?t={TOKEN}")
+        self.assertEqual((r[:2], body_of(r)), ((200, "application/json; charset=utf-8"),
+                                               {"attribution": "Imagery: Sentinel-2 cloudless by EOX", "areas": []}))
+        self.assertIs(self.c.state()["tiles"], True)
+        # the sources by area (imagery.credits_by_area): the page credits only those its view shows
+        areas = [["GUGiK geoportal.gov.pl", 14.0, 49.0, 24.2, 54.9], ["Sentinel-2 cloudless by EOX"]]
+        self.mt.imagery = types.SimpleNamespace(credits_by_area=lambda: areas)
+        self.assertEqual(body_of(self.get(f"/api/attribution?t={TOKEN}"))["areas"], areas)
+        self.mt.imagery = types.SimpleNamespace(credits_by_area=lambda: 1 / 0)
+        self.assertEqual(body_of(self.get(f"/api/attribution?t={TOKEN}"))["areas"], [])
+        self.mt.credit = OSError("broken")
+        self.assertEqual(body_of(self.get(f"/api/attribution?t={TOKEN}")), {"attribution": "", "areas": []})
+        self.c.tiles = None
+        self.assertEqual(body_of(self.get(f"/api/attribution?t={TOKEN}")), {"attribution": "", "areas": []})
+        self.assertIs(self.c.state()["tiles"], False)
+        self.assertEqual(run(self.c.respond("POST", "/api/attribution", dict(HOST, **{"x-bne-token": TOKEN})))[0],
+                         405)
+
+    def test_at_most_six_at_once(self):
+        """TILES_AT_ONCE fetches at once; the rest wait (and are served once one finishes)."""
+        lock, release = threading.Lock(), threading.Event()
+        now = {"in": 0, "max": 0, "started": 0}
+
+        class Blocking(FakeMapTiles):
+            def layer_tile(self, layer, z, x, y):
+                with lock:
+                    now["in"] += 1
+                    now["started"] += 1
+                    now["max"] = max(now["max"], now["in"])
+                try:
+                    release.wait(5)
+                    return JPEG
+                finally:
+                    with lock:
+                        now["in"] -= 1
+        self.c.tiles = Blocking()
+        n = companion.TILES_AT_ONCE + 4
+
+        async def body():
+            asks = [asyncio.ensure_future(self.c.respond("GET", f"/api/tiles/sat/4/{i}/0?t={TOKEN}", dict(HOST)))
+                    for i in range(n)]
+            for _ in range(200):
+                if now["started"] >= companion.TILES_AT_ONCE:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)                        # (time for a 7th to start, if it could)
+            self.assertEqual((now["started"], now["in"]), (companion.TILES_AT_ONCE, companion.TILES_AT_ONCE))
+            self.assertFalse(any(a.done() for a in asks))
+            # the state still answers meanwhile (the tiles wait on the loop, never block it)
+            self.assertEqual((await self.c.respond("GET", f"/api/state?t={TOKEN}", dict(HOST)))[0], 200)
+            release.set()
+            return await asyncio.gather(*asks)
+        try:
+            got = run(body())
+        finally:
+            release.set()
+        self.assertEqual([g[0] for g in got], [200] * n)
+        self.assertEqual((now["max"], now["started"]), (companion.TILES_AT_ONCE, n))
+
+
+class VendorFilesTest(unittest.TestCase):
+    """The bundled MapLibre GL JS (server/companion_web/vendor/maplibre-gl/): served as is, with its types."""
+
+    def test_served(self):
+        web = Path(companion.WEB_DIR)
+        c = companion.Companion(tempfile.gettempdir(), token=TOKEN)
+        c.port = PORT
+        for path, ctype in (("/vendor/maplibre-gl/maplibre-gl.js", "text/javascript; charset=utf-8"),
+                            ("/vendor/maplibre-gl/maplibre-gl.css", "text/css; charset=utf-8"),
+                            ("/vendor/maplibre-gl/LICENSE.txt", "text/plain; charset=utf-8")):
+            st, got_type, body = run(c.respond("GET", path, dict(HOST)))
+            self.assertEqual((st, got_type), (200, ctype), path)
+            self.assertEqual(body, (web / path.lstrip("/")).read_bytes(), path)
+        js = run(c.respond("GET", "/vendor/maplibre-gl/maplibre-gl.js", dict(HOST)))[2]
+        self.assertIn(b"maplibre-gl-js/blob/v4.7.1/LICENSE.txt", js[:400])     # the version docs/COMPANION.md names
+        self.assertIn(b"Redistribution and use", run(c.respond("GET", "/vendor/maplibre-gl/LICENSE.txt",
+                                                               dict(HOST)))[2])
+        for path in ("/vendor/maplibre-gl/", "/vendor/", "/vendor/maplibre-gl/maplibre-gl.js.map",
+                     "/vendor/maplibre-gl/../app.js", "/vendor/maplibre-gl/maplibre-gl-csp.js"):
+            self.assertEqual(run(c.respond("GET", path, dict(HOST)))[0], 404, path)
+
+
+class TilesSocketTest(unittest.TestCase):
+    """A tile over a real socket: its Cache-Control (an hour, private), everything else's no-store."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_headers(self):
+        async def main():
+            c = companion.Companion(self.tmp.name, os.path.join(self.tmp.name, "web"), token=TOKEN,
+                                    tiles=FakeMapTiles({("sat", 1, 0, 0): None}))
+            srv, port = await c.start(0)
+            http = Http(port)
+            try:
+                st, h, data = await http.request("GET", f"/api/tiles/labels/1/1/1?t={TOKEN}")
+                self.assertEqual((st, h["content-type"], h["cache-control"], data),
+                                 (200, "image/png", "private, max-age=3600", PNG))
+                self.assertEqual(h["content-length"], str(len(PNG)))
+                self.assertFalse([k for k in h if k.startswith("access-control")])
+                st, h, data = await http.request("HEAD", f"/api/tiles/sat/1/1/1?t={TOKEN}")
+                self.assertEqual((st, h["cache-control"], h["content-length"], data),
+                                 (200, "private, max-age=3600", str(len(JPEG)), b""))
+                for target in (f"/api/tiles/sat/1/0/0?t={TOKEN}", "/api/tiles/sat/1/1/1", f"/api/state?t={TOKEN}",
+                               f"/api/attribution?t={TOKEN}", "/vendor/maplibre-gl/LICENSE.txt"):
+                    st, h, _ = await http.request("GET", target)
+                    self.assertEqual(h["cache-control"], "no-store", target)
+            finally:
+                c.close()
+                srv.close()
+                await asyncio.sleep(0.05)
         run(main())
 
 

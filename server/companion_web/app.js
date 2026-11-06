@@ -1,5 +1,7 @@
-// BeamNG.Earth live map (phases 1 and 2 of the Google Maps integration; contract: docs/COMPANION.md).
-// Plain JS, no build step. The only external script is Google's Maps JavaScript API, loaded with the player's own key.
+// BeamNG.Earth live map (phases 1 to 3 of the Google Maps integration; contract: docs/COMPANION.md).
+// Plain JS, no build step. The map is drawn by one of two renderers behind one small interface ("renderers" below):
+// MapLibre GL JS (bundled in vendor/maplibre-gl/, the default: no key) over a keyless base map, or Google's Maps
+// JavaScript API, loaded only when the player picks it with their own key.
 // Everything that comes from the server or from Google is inserted as text (textContent), never as HTML.
 (function () {
   "use strict";
@@ -11,11 +13,19 @@
   const SITE = "http://" + location.host + "/*";     // what the key's website restriction must allow for this page
   const KEY_RE = /^[A-Za-z0-9_-]{20,80}$/;
   const UNITS_KEY = "bne.liveMap.units";
+  const BASE_KEY = "bne.liveMap.base";
   const RETRY_MS = 3000;
   const BUSY_MS = 61000;          // after a 429 (the server blocks a peer for 60 s)
   const LAN_POLL_MS = 5000;       // the phone box asks /api/lan this often (a new code made in the game shows too)
   const JUMP_M = 2000;            // a move farther than this between two states is a teleport: no animation
-  const FIRST_ZOOM = 16;
+  const FIRST_ZOOM = 16;          // zoom levels in this file are Google's (256 px tiles) whichever renderer draws
+  // phase 3: the base maps (docs/COMPANION.md "The map without a key")
+  const BASES = ["streets", "satellite", "terrain", "google"];
+  const BASE_NAMES = { streets: "Streets", satellite: "Satellite", terrain: "Terrain", google: "Google Maps" };
+  const STREETS_STYLE = "https://tiles.openfreemap.org/styles/liberty";
+  const TILE_MAX_Z = 18;          // maptiles.MAX_Z: the deepest tile the server makes (MapLibre overzooms beyond)
+  const EOX_CREDIT = "EOX IT Services GmbH (maps.eox.at), data © OpenStreetMap contributors and others";
+  const BASE_GRACE_MS = 12000;    // a base map whose style or first tiles have not loaded by then has failed
   const MSG_EXPIRED = PHONE
     ? "This link has expired: scan the new QR code on the PC"
     : "This link is no longer valid (the world server was restarted?). Open the Live map again from the game (world map > Live map).";
@@ -23,6 +33,11 @@
   // (a phone cannot tell a lost Wi-Fi from sharing stopped on the PC: nothing answers either way)
   const MSG_NO_SERVER = PHONE ? "The PC is not reachable (same Wi-Fi? sharing still on?)" : "World server not reachable";
   const MSG_BUSY = "Too many requests: wait a minute";
+  const MSG_STREETS_DOWN = "Street map unavailable (offline?): showing the world server's satellite map";
+  const MSG_KEY_REFUSED = "Google did not accept the API key. In Google Cloud check that the key may use the Maps JavaScript API, " +
+    "that billing is enabled, and that its website restriction allows " + SITE + (PHONE
+    ? " (this phone's address, besides the PC's). The key itself is replaced or removed on the PC."
+    : " . Replace or remove the key below.");
 
   // ------------------------------------------------------------------------------------------ state
   let units = loadUnits();        // "metric" | "imperial"
@@ -33,11 +48,15 @@
   let expired = false;
   let keyStored = "";
 
-  let map = null;
-  let useAdvanced = false;        // AdvancedMarkerElement (true) or the classic google.maps.Marker (fallback)
-  let carMarker = null, destMarker = null, searchMarker = null, infoWin = null;
-  let routeLine = null, routeCasing = null;
+  let view = null;                // the renderer drawing the map (libreView / googleView), null while none is up
+  let lastAt = null;              // the last view ({lat, lon, zoom}) of a renderer that was taken down
+  let base = "";                  // the base map shown or being loaded: one of BASES
+  let baseSeq = 0;                // bumped by every switch: a slow Google start that was overtaken is dropped
+  let streetsDown = false;        // the street map failed in this page (offline?) and the fallback was used
+  let libreBroken = false;        // MapLibre cannot run here (no WebGL, its script missing)
+  let mapMsg = false;             // the message card shows a map problem (hidden again when a base map loads)
   let routeVersion = -1, routePoints = [];
+  let searchPin = null;           // {lat, lon, title}: the search result the menu is open for
   let hadGps = false;
   let follow = true;
   let menuOpen = false;           // the click menu holds the map still (follow mode would pan it away)
@@ -46,7 +65,6 @@
   let anim = null;                // {from, to, start, dur}
   let animating = false;
   let lastPoseAt = 0;
-  let lastIconHeading = NaN;
 
   // ------------------------------------------------------------------------------------------ helpers
   function el(tag, cls, text) {
@@ -95,13 +113,13 @@
   function fmtCoord(lat, lon) { return lat.toFixed(5) + ", " + lon.toFixed(5); }
 
   let toastTimer = 0;
-  function toast(text, bad) {
+  function toast(text, bad, ms) {
     const t = $("toast");
     t.textContent = text;
     t.className = bad ? "bad" : "";
     t.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { t.hidden = true; }, bad ? 6000 : 2500);
+    toastTimer = setTimeout(() => { t.hidden = true; }, ms || (bad ? 6000 : 2500));
   }
 
   function showMessage(text, bad) {
@@ -109,6 +127,13 @@
     m.textContent = text;
     m.className = "card" + (bad ? " bad" : "");
     m.hidden = false;
+    mapMsg = false;
+  }
+  // a map problem (no base map at all): hidden again when one loads; never over the expired link's message
+  function mapMessage(text) {
+    if (expired) return;
+    showMessage(text, true);
+    mapMsg = true;
   }
 
   function setStatus() {
@@ -219,11 +244,13 @@
     const b = $("followBtn");
     b.classList.toggle("on", on);
     b.setAttribute("aria-pressed", String(on));
-    if (on) centreOnCar();
+    if (view) view.follow(on);
+    if (on) centreOnCar(false);
   }
 
-  function centreOnCar() {
-    if (map && shown) map.setCenter({ lat: shown.lat, lng: shown.lon });
+  // soft: the animation's frames, which leave a map alone while it moves (a wheel zoom, a pinch: MapLibre would stop it)
+  function centreOnCar(soft) {
+    if (view && shown) view.centre(shown.lat, shown.lon, soft);
   }
 
   // ------------------------------------------------------------------------------------------ state
@@ -242,15 +269,12 @@
     if (!g) {
       if (hadGps) { routePoints = []; drawRoute(); }    // no destination: no route either
       hadGps = false;
-      if (destMarker) { destMarker.remove(); destMarker = null; }
+      if (view) view.setDest(null);
       return;
     }
     hadGps = true;
-    if (!map || !num(g.lat) || !num(g.lon)) return;
-    const pos = { lat: g.lat, lng: g.lon };
-    if (destMarker) destMarker.set(pos);
-    else destMarker = makeMarker(pos, pinElement("dest-pin", "#ff5d5d"), classicPin("#ff5d5d", 1.6), 900);
-    destMarker.setTitle(g.name || "Destination");
+    if (!view || !num(g.lat) || !num(g.lon)) return;
+    view.setDest({ lat: g.lat, lon: g.lon, title: g.name || "Destination" });
   }
 
   // ------------------------------------------------------------------------------------------ the car
@@ -283,41 +307,6 @@
     d.append(svg);
     return d;
   }
-  function classicPin(color, scale) {
-    return {
-      path: "M0,0 C-2,-14 -14,-16 -14,-26 A14,14 0 1,1 14,-26 C14,-16 2,-14 0,0 Z",
-      fillColor: color, fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2, scale: scale / 1.6,
-      anchor: new google.maps.Point(0, 0),
-    };
-  }
-  function carIcon(heading) {
-    if (!num(heading)) {
-      return { path: google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: "#3fa7ff", fillOpacity: 1,
-        strokeColor: "#ffffff", strokeWeight: 2.5 };
-    }
-    return { path: ARROW_PATH, rotation: heading, fillColor: "#3fa7ff", fillOpacity: 1, strokeColor: "#ffffff",
-      strokeWeight: 2.2, scale: 1.1, anchor: new google.maps.Point(0, 0) };
-  }
-
-  // one wrapper over both marker kinds: set(pos), setTitle(t), remove()
-  function makeMarker(pos, content, classicIcon, z) {
-    if (useAdvanced) {
-      const m = new google.maps.marker.AdvancedMarkerElement({ map: map, position: pos, content: content, zIndex: z });
-      return {
-        el: content,
-        set(p) { m.position = p; },
-        setTitle(t) { m.title = t; },
-        remove() { m.map = null; },
-      };
-    }
-    const m = new google.maps.Marker({ map: map, position: pos, icon: classicIcon, zIndex: z, clickable: false });
-    return {
-      m: m,
-      set(p) { m.setPosition(p); },
-      setTitle(t) { m.setTitle(t); },
-      remove() { m.setMap(null); },
-    };
-  }
 
   function distM(a, b) {
     const R = 6371000, r = Math.PI / 180;
@@ -328,7 +317,7 @@
 
   function onPlayer(p) {
     if (!p || !num(p.lat) || !num(p.lon)) {
-      if (carMarker) { carMarker.remove(); carMarker = null; }
+      if (view) view.setCar(null);
       shown = null;
       return;
     }
@@ -338,11 +327,11 @@
     lastPoseAt = now;
     if (!shown) {
       shown = { lat: p.lat, lon: p.lon, heading: heading };
-      if (map) {
+      if (view) {
         placeCar();
         if (follow && !menuOpen) {
-          centreOnCar();
-          if (map.getZoom() < 10) map.setZoom(FIRST_ZOOM);
+          centreOnCar(false);
+          if (view.getView().zoom < 10) view.setView({ lat: shown.lat, lon: shown.lon, zoom: FIRST_ZOOM });
         }
       }
       return;
@@ -374,37 +363,16 @@
     }
     if (k >= 1) shown.heading = t.heading;
     if (shown.lon > 180) shown.lon -= 360; else if (shown.lon < -180) shown.lon += 360;
-    if (map) {
+    if (view) {
       placeCar();
-      if (follow && !menuOpen) centreOnCar();
+      if (follow && !menuOpen) centreOnCar(true);
     }
     if (k < 1) requestAnimationFrame(frame);
     else animating = false;
   }
 
   function placeCar() {
-    if (!map || !shown) return;
-    const pos = { lat: shown.lat, lng: shown.lon };
-    if (!carMarker) {
-      carMarker = makeMarker(pos, carElement(), carIcon(shown.heading), 1000);
-      carMarker.setTitle("Your car");
-      lastIconHeading = NaN;
-    } else carMarker.set(pos);
-    rotateCar();
-  }
-
-  function rotateCar() {
-    if (!carMarker || !shown) return;
-    const h = shown.heading;
-    if (useAdvanced) {
-      carMarker.el.classList.toggle("noheading", h == null);
-      // the arrow is in screen space: subtract the map's own rotation (vector maps can be rotated)
-      if (h != null) carMarker.el.firstChild.style.transform = "rotate(" + (h - (map.getHeading() || 0)).toFixed(1) + "deg)";
-    } else {
-      // setIcon is not free: only when the heading changed visibly
-      const hv = h == null ? -1 : Math.round(h);
-      if (hv !== lastIconHeading) { lastIconHeading = hv; carMarker.m.setIcon(carIcon(h)); }
-    }
+    if (view && shown) view.setCar(shown);
   }
 
   // ------------------------------------------------------------------------------------------ the route
@@ -418,33 +386,27 @@
 
   function drawRoute() {
     $("routeCredit").hidden = !routePoints.length;
-    if (!map) return;
-    if (!routePoints.length) {
-      if (routeLine) routeLine.setMap(null);
-      if (routeCasing) routeCasing.setMap(null);
-      return;
-    }
-    const path = routePoints.map((q) => ({ lat: q[0], lng: q[1] }));
-    if (!routeLine) {
-      routeCasing = new google.maps.Polyline({ map: map, path: path, strokeColor: "#0b3558", strokeOpacity: 0.9,
-        strokeWeight: 9, clickable: false, zIndex: 4 });
-      routeLine = new google.maps.Polyline({ map: map, path: path, strokeColor: "#3fa7ff", strokeOpacity: 1,
-        strokeWeight: 5, clickable: false, zIndex: 5 });
-    } else {
-      routeCasing.setPath(path); routeCasing.setMap(map);
-      routeLine.setPath(path); routeLine.setMap(map);
-    }
+    if (view) view.setRoute(routePoints);
+  }
+
+  // every overlay onto a renderer that was just put up (the data lives here, not in the renderer)
+  function drawOverlays() {
+    if (!view) return;
+    view.setCar(shown);
+    renderDest();
+    view.setRoute(routePoints);
+    view.setSearchPin(searchPin);
   }
 
   // ------------------------------------------------------------------------------------------ the menu
   function closeMenu() {
     menuOpen = false;
-    if (infoWin) infoWin.close();
-    if (searchMarker) { searchMarker.remove(); searchMarker = null; }
+    if (view) view.closeMenu();
+    if (searchPin) { searchPin = null; if (view) view.setSearchPin(null); }
   }
 
   function openMenu(lat, lon, title, detail) {
-    if (!map) return;
+    if (!view) return;
     lon = ((lon + 540) % 360) - 180;
     lat = clamp(lat, -90, 90);
     lat = Math.round(lat * 1e6) / 1e6;
@@ -470,11 +432,8 @@
     bNo.addEventListener("click", closeMenu);
     box.append(bGps, bTp, bNo);
     root.append(box);
-    infoWin.setContent(root);
     // above the search pin when there is one, else pointing at the clicked spot
-    infoWin.setOptions({ pixelOffset: new google.maps.Size(0, searchMarker ? -30 : 0) });
-    infoWin.setPosition({ lat: lat, lng: lon });
-    infoWin.open({ map: map });
+    view.openMenu(lat, lon, root, !!searchPin);
     menuOpen = true;
   }
 
@@ -531,14 +490,13 @@
     if (!x) return;
     hideResults();
     $("search").blur();
-    if (!map) { toast("The map is not loaded", true); return; }
+    if (!view) { toast("The map is not loaded", true); return; }
     setFollow(false);
-    const pos = { lat: x.lat, lng: x.lon };
-    map.panTo(pos);
-    if (map.getZoom() < 14) map.setZoom(15);
+    if (view.getView().zoom < 14) view.setView({ lat: x.lat, lon: x.lon, zoom: 15 });
+    else view.panTo(x.lat, x.lon);
     closeMenu();
-    searchMarker = makeMarker(pos, pinElement("search-pin", "#f0b429"), classicPin("#f0b429", 1.1), 800);
-    searchMarker.setTitle(x.name || "");
+    searchPin = { lat: x.lat, lon: x.lon, title: x.name || "" };
+    view.setSearchPin(searchPin);
     openMenu(x.lat, x.lon, x.name || "Search result", x.detail || "");
   }
 
@@ -562,6 +520,7 @@
   }
 
   // ------------------------------------------------------------------------------------------ key panel
+  // Opened from the base map picker only ("Google Maps (your own key)…"), never by itself (phase 3).
   function setupKeyPanel(key) {
     keyStored = key;
     document.querySelectorAll(".keysite").forEach((c) => { c.textContent = SITE; });
@@ -571,19 +530,16 @@
       $("keyPhone").hidden = false;
       $("keyLead").textContent = key
         ? "The Google Maps key comes from the PC (it is set and changed on the PC's Live map page)."
-        : "No Google Maps key is set, so Google shows a dimmed “for development purposes only” map. The key is set on the PC: paste it on the PC's Live map page.";
-      showKeyPanel(!key);
+        : "No Google Maps key is set. The key is set on the PC: paste it on the PC's Live map page, then reload this page to find Google Maps among the base maps.";
       return;
     }
     $("keyStored").hidden = !key;
     $("keyLead").textContent = key
-      ? "Paste a new key to replace the stored one."
-      : "Without a key Google shows a dimmed “for development purposes only” map, which is enough to try it. Paste your own key to get the full map.";
-    showKeyPanel(!key);
+      ? "Google Maps is among the base maps. Paste a new key to replace the stored one."
+      : "The map works without a key. With your own Google Maps key, Google's map is one more base map: paste the key here.";
   }
   function showKeyPanel(on) {
     $("keyPanel").hidden = !on;
-    $("keyShow").hidden = on;
   }
   function keyError(text) {
     const e = $("keyError");
@@ -592,14 +548,13 @@
   }
   function wireKeyPanel() {
     $("keyHide").addEventListener("click", () => showKeyPanel(false));
-    $("keyShow").addEventListener("click", () => showKeyPanel(true));
     $("keyForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const k = $("keyInput").value.trim();
       if (!KEY_RE.test(k)) { keyError("That does not look like an API key (20-80 letters, digits, - or _)."); return; }
       keyError("");
       const r = await post("/api/key", { key: k });
-      if (r.ok) location.reload();
+      if (r.ok) { saveBaseChoice("google"); location.reload(); }      // a new key: show Google's map at once
       else keyError(r.error);
     });
     let armed = 0;
@@ -618,82 +573,625 @@
     });
   }
 
-  // ------------------------------------------------------------------------------------------ Google Maps
-  let mapsFailed = false;
-  function mapFailed(text) {
-    mapsFailed = true;
-    showMessage(text, true);
+  // ------------------------------------------------------------------------------------------ base maps
+  // streets / satellite / terrain are MapLibre styles (one renderer, setStyle between them); google is the other
+  // renderer. Switching keeps the view (centre, zoom) and draws the overlays again; the click menu closes.
+  function baseAvailable(id) {
+    if (id === "streets") return true;
+    if (id === "satellite" || id === "terrain") return !!(state && state.tiles);
+    if (id === "google") return KEY_RE.test(keyStored);
+    return false;
   }
+  function loadBaseChoice() {
+    try { return localStorage.getItem(BASE_KEY) || ""; } catch (e) { return ""; }
+  }
+  function saveBaseChoice(id) {
+    try { localStorage.setItem(BASE_KEY, id); } catch (e) { /* private window: not remembered */ }
+  }
+  function firstBase() {
+    const b = loadBaseChoice();
+    if (BASES.indexOf(b) >= 0 && baseAvailable(b)) return b;
+    return baseAvailable("google") ? "google" : "streets";      // a stored key: Google until the player picks another
+  }
+
+  function startView() {
+    if (lastAt) return lastAt;
+    return shown ? { lat: shown.lat, lon: shown.lon, zoom: FIRST_ZOOM } : { lat: 30, lon: 0, zoom: 3 };
+  }
+  function currentView() { return view ? view.getView() : startView(); }
+
+  // the server's imagery credit (/api/attribution), asked once before the first raster base map
+  // and its sources by area ([credit, w, s, e, n] or [credit]): only those the view shows are credited, as the in-game
+  // map does (the whole line names every regional service the server knows: dozens)
+  let tilesCredit = "", tilesAreas = [], creditAsk = null;
+  function loadCredit() {
+    if (!creditAsk) {
+      creditAsk = getJSON("/api/attribution").then((r) => {
+        if (r.status === 200 && r.data && typeof r.data.attribution === "string") {
+          tilesCredit = r.data.attribution;
+          tilesAreas = Array.isArray(r.data.areas) ? r.data.areas.filter((a) => Array.isArray(a) && typeof a[0] === "string") : [];
+        } else creditAsk = null;    // asked again next time
+      });
+    }
+    return creditAsk;
+  }
+  // the imagery credit for a view {west, south, east, north} (degrees; west > east across the antimeridian)
+  function creditFor(b) {
+    if (!tilesAreas.length) return tilesCredit;
+    const meets = (w, e) => {
+      if (b.east - b.west >= 360) return true;
+      for (const k of [-360, 0, 360]) if (w + k <= b.east && e + k >= b.west) return true;
+      return false;
+    };
+    const used = [];
+    for (const a of tilesAreas) {
+      if (used.includes(a[0])) continue;
+      if (a.length >= 5 && !(a[2] <= b.north && a[4] >= b.south && meets(a[1], a[3]))) continue;
+      used.push(a[0]);
+    }
+    return used.length ? "Map imagery: " + used.join("; ") : "";
+  }
+
+  const hooks = {
+    click(lat, lon) {
+      hideResults();
+      if (searchPin) { searchPin = null; if (view) view.setSearchPin(null); }
+      openMenu(lat, lon, null, null);
+    },
+    dragstart() { if (follow) setFollow(false); },
+    menuClosed() { closeMenu(); },
+    baseOk(id) {
+      if (id === "streets") streetsDown = false;
+      if (mapMsg) { $("message").hidden = true; mapMsg = false; }
+    },
+    baseFailed(id) {
+      if (id !== base) return;
+      if (id === "streets") {
+        streetsDown = true;
+        if (baseAvailable("satellite")) { toast(MSG_STREETS_DOWN, false, 10000); setBase("satellite"); }
+        else mapMessage("No map can be shown: the street map is unavailable (offline?) and the world server has no map tiles to show instead.");
+        return;
+      }
+      if (streetsDown) mapMessage("No map can be shown: the street map is unavailable (offline?) and the world server's map tiles do not load either.");
+      else toast("The world server's " + BASE_NAMES[id].toLowerCase() + " map does not load", true);
+    },
+  };
+
+  // show a base map (not remembered: pickBase remembers the player's own choices)
+  async function setBase(id) {
+    closeMenu();
+    if (!baseAvailable(id)) id = "streets";
+    const seq = ++baseSeq;
+    base = id;
+    renderPicker();
+    if (id === "google") {
+      let v = null;
+      try { v = await googleView(currentView()); } catch (e) {
+        console.warn("Google Maps", e);
+        if (seq === baseSeq) googleFailed(e && e.message ? e.message : String(e));
+        return;
+      }
+      if (seq !== baseSeq) { v.destroy(false); return; }        // another base map was picked meanwhile
+      useView(v);
+      return;
+    }
+    if (id !== "streets") await loadCredit();
+    if (seq !== baseSeq) return;
+    if (view && view.kind === "maplibre") { view.setBase(id); return; }
+    if (libreBroken) { noLibre(null); return; }
+    let v = null;
+    try { v = libreView(id, currentView()); } catch (e) { console.error(e); noLibre(e); return; }
+    useView(v);
+  }
+
+  function useView(v) {
+    const at = currentView();
+    if (view) view.destroy(false);
+    view = v;
+    v.setView(at);
+    v.follow(follow);
+    drawOverlays();
+  }
+
+  function pickBase(id) {
+    if (id === "google" && googleBad) {
+      keyError(MSG_KEY_REFUSED);
+      showKeyPanel(true);
+      return;
+    }
+    saveBaseChoice(id);
+    if (id !== base || !view) setBase(id);
+  }
+
+  // MapLibre cannot run (no WebGL: an old phone, graphics acceleration off; its script missing): Google with a key
+  function noLibre(e) {
+    libreBroken = true;
+    if (baseAvailable("google") && !googleBad) { setBase("google"); return; }
+    mapMessage("This browser cannot show the map (" + (e && e.message ? e.message : "WebGL is not available") +
+      "). Turn on graphics acceleration in the browser's settings, or use another browser.");
+  }
+
+  // the picker: the button names the base map, its list switches (on a phone too: plain buttons, no hover)
+  function pickerOpen() { return !$("baseList").hidden; }
+  function openPicker() {
+    $("baseList").hidden = false;
+    $("baseBtn").setAttribute("aria-expanded", "true");
+    renderPicker();
+  }
+  function closePicker() {
+    $("baseList").hidden = true;
+    $("baseBtn").setAttribute("aria-expanded", "false");
+  }
+  function renderPicker() {
+    $("baseBtn").textContent = BASE_NAMES[base] || "Map";
+    const ul = $("baseList");
+    if (ul.hidden) return;
+    ul.textContent = "";
+    const item = (b) => { const li = el("li"); li.setAttribute("role", "none"); li.append(b); ul.append(li); };
+    BASES.filter(baseAvailable).forEach((id) => {
+      const b = el("button", id === base ? "on" : null, BASE_NAMES[id]);
+      b.type = "button";
+      b.setAttribute("role", "menuitemradio");
+      b.setAttribute("aria-checked", String(id === base));
+      b.addEventListener("click", () => { closePicker(); pickBase(id); });
+      item(b);
+    });
+    const k = el("button", "keyitem", "Google Maps (your own key)…");
+    k.type = "button";
+    k.setAttribute("role", "menuitem");
+    k.addEventListener("click", () => { closePicker(); showKeyPanel(true); });
+    item(k);
+  }
+  function wirePicker() {
+    $("baseBtn").addEventListener("click", () => { if (pickerOpen()) closePicker(); else openPicker(); });
+    document.addEventListener("pointerdown", (e) => {
+      if (pickerOpen() && !$("basePick").contains(e.target)) closePicker();
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------ renderers
+  // Both renderers have the same methods; the page above does not care which map is underneath:
+  //   kind, setCar({lat, lon, heading} | null), setDest({lat, lon, title} | null), setRoute([[lat, lon], ...]),
+  //   setSearchPin({lat, lon, title} | null), openMenu(lat, lon, element, abovePin), closeMenu(),
+  //   centre(lat, lon, soft), panTo(lat, lon), getView() -> {lat, lon, zoom}, setView({lat, lon, zoom}),
+  //   follow(on), destroy(dead); MapLibre's also setBase(id).
+  // They call the page back through `hooks`: click(lat, lon), dragstart(), menuClosed(), baseOk(id), baseFailed(id).
+
+  // ---- MapLibre (phase 3, the default). Its zoom is one less than Google's for the same scale (512 px tiles).
+  const ROUTE_SRC = "bne-route";
+
+  // MapLibre's attribution control inserts its strings as HTML: the server's text goes in escaped
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function tileUrl(layer) {
+    return location.origin + "/api/tiles/" + layer + "/{z}/{x}/{y}?t=" + encodeURIComponent(TOKEN);
+  }
+  function libreStyle(id) {
+    if (id === "streets") return STREETS_STYLE;
+    const raster = (layer, credit) => ({ type: "raster", tiles: [tileUrl(layer)], tileSize: 256, maxzoom: TILE_MAX_Z,
+      attribution: credit ? esc(credit) : "" });
+    return {
+      version: 8,
+      sources: {
+        "bne-base": id === "terrain" ? raster("map", "Terrain Light by " + EOX_CREDIT) : raster("sat", ""),     // (credited by the view: tileCredit)
+        "bne-labels": raster("labels", "Overlay by " + EOX_CREDIT),
+      },
+      layers: [
+        { id: "bne-bg", type: "background", paint: { "background-color": "#0d1014" } },
+        { id: "bne-base", type: "raster", source: "bne-base" },
+        { id: "bne-labels", type: "raster", source: "bne-labels" },
+      ],
+    };
+  }
+
+  function libreView(baseId, at) {
+    if (typeof maplibregl === "undefined") throw new Error("the map library did not load");
+    const box = el("div", "mapview");
+    $("map").append(box);
+    let map;
+    try {
+      map = new maplibregl.Map({
+        container: box,
+        style: libreStyle(baseId),
+        center: [at.lon, at.lat],
+        zoom: Math.max(0, at.zoom - 1),
+        // north up: a turn by two fingers would fight the panning on a phone (and the car's arrow is compass-true)
+        dragRotate: false, pitchWithRotate: false, touchPitch: false, maxPitch: 0,
+        cooperativeGestures: false,
+        attributionControl: false,      // (added compact below: the expanded one would sit under the imagery credit)
+      });
+    } catch (e) { box.remove(); throw e; }
+    map.touchZoomRotate.disableRotation();
+    map.keyboard.disableRotation();
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+    // (a compact one still starts open: closed once the map is up; its (i) opens it)
+    map.once("load", () => {
+      const a = box.querySelector(".maplibregl-ctrl-attrib");
+      if (a) { a.classList.remove("maplibregl-compact-show"); a.removeAttribute("open"); }
+    });
+    // the satellite map's imagery credit, for what the view shows (two lines; a click shows it whole)
+    let curBase = baseId;
+    const credit = el("div", "tilecredit");
+    credit.addEventListener("click", () => credit.classList.toggle("full"));
+    box.append(credit);
+    function tileCredit() {
+      const t = curBase === "satellite" ? creditFor({ west: map.getBounds().getWest(), south: map.getBounds().getSouth(),
+        east: map.getBounds().getEast(), north: map.getBounds().getNorth() }) : "";
+      credit.textContent = t;
+      credit.hidden = !t;
+    }
+    map.on("moveend", tileCredit);
+    tileCredit();
+
+    let car = null, dest = null, pin = null, popup = null;
+    let route = [];
+    let watch = null;             // the base map being checked: {id, loaded, errors, timer}
+
+    // -- the route: a GeoJSON line with a casing; setStyle drops it, so it is added again after every style load
+    function routeData() {
+      const coords = [];
+      let prev = null;
+      for (const q of route) {
+        let lon = q[1];
+        // unwrapped longitudes: a route over the antimeridian is drawn the short way
+        if (prev != null) { while (lon - prev > 180) lon -= 360; while (lon - prev < -180) lon += 360; }
+        coords.push([lon, q[0]]);
+        prev = lon;
+      }
+      return { type: "FeatureCollection", features: coords.length < 2 ? [] :
+        [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } }] };
+    }
+    function addRoute() {
+      if (map.getSource(ROUTE_SRC)) return;
+      map.addSource(ROUTE_SRC, { type: "geojson", data: routeData() });
+      // under the labels (the street map's names, the raster labels), over everything else: the first symbol layer
+      // after the last 3D building layer (liberty's one-way arrows come before its bridges and buildings)
+      const order = map.getLayersOrder();
+      let from = 0;
+      order.forEach((id, i) => { if (map.getLayer(id).type === "fill-extrusion") from = i + 1; });
+      const before = order.slice(from).find((id) => id === "bne-labels" || map.getLayer(id).type === "symbol");
+      const line = { "line-join": "round", "line-cap": "round" };
+      map.addLayer({ id: ROUTE_SRC + "-casing", type: "line", source: ROUTE_SRC, layout: line,
+        paint: { "line-color": "#0b3558", "line-opacity": 0.9, "line-width": 9 } }, before);
+      map.addLayer({ id: ROUTE_SRC + "-line", type: "line", source: ROUTE_SRC, layout: line,
+        paint: { "line-color": "#3fa7ff", "line-width": 5 } }, before);
+    }
+
+    // -- the base map check: the style must load and its tiles must not all fail in the first seconds (offline,
+    // OpenFreeMap down). A missing tile (404) is not an error to MapLibre: the world server's empty spots are fine.
+    function isBaseSource(src) { return !!src && src !== ROUTE_SRC && src !== "bne-labels"; }
+    function watchBase(id) {
+      if (watch) clearTimeout(watch.timer);
+      const w = watch = { id: id, loaded: false, errors: 0, timer: 0 };
+      w.timer = setTimeout(() => { if (watch === w && (!w.loaded || w.errors)) baseDone(w, false); }, BASE_GRACE_MS);
+    }
+    function baseDone(w, ok) {
+      if (watch !== w) return;
+      clearTimeout(w.timer);
+      watch = null;
+      if (ok) hooks.baseOk(w.id); else hooks.baseFailed(w.id);
+    }
+    map.on("style.load", () => {
+      addRoute();
+      if (watch) watch.loaded = true;
+    });
+    map.on("data", (e) => {
+      const w = watch;
+      if (w && w.loaded && e.dataType === "source" && e.tile && isBaseSource(e.sourceId)) baseDone(w, true);
+    });
+    map.on("error", (e) => {
+      const err = e && e.error;
+      console.warn("map:", err && err.message ? err.message : err);
+      const w = watch;
+      if (!w) return;
+      if (!e.sourceId) { if (!w.loaded) baseDone(w, false); return; }        // the style itself did not load
+      // (only the current style's sources: a late error of the previous one does not count)
+      if (w.loaded && isBaseSource(e.sourceId) && map.getSource(e.sourceId) && ++w.errors >= 3) baseDone(w, false);
+    });
+    watchBase(baseId);
+
+    // the street map's style names a few icons its sprite lacks: an empty image instead of a console warning each
+    map.on("styleimagemissing", (e) => {
+      if (!map.hasImage(e.id)) map.addImage(e.id, { width: 1, height: 1, data: new Uint8Array(4) });
+    });
+    let pressed = 0;              // pointers down on the map (a mouse button, fingers)
+    const release = () => { pressed = 0; };
+    box.addEventListener("pointerdown", () => { pressed++; }, true);
+    window.addEventListener("pointerup", release, true);
+    window.addEventListener("pointercancel", release, true);
+    map.on("dragstart", () => hooks.dragstart());
+    map.on("click", (e) => {
+      const t = e.originalEvent && e.originalEvent.target;
+      if (t && t.closest && t.closest(".maplibregl-popup")) return;          // a click inside the menu
+      const ll = e.lngLat.wrap();
+      hooks.click(ll.lat, ll.lng);
+    });
+
+    function setPin(m, p, cls, color) {
+      if (!p) { if (m) m.remove(); return null; }
+      if (!m) m = new maplibregl.Marker({ element: pinElement(cls, color), anchor: "bottom" }).setLngLat([p.lon, p.lat]).addTo(map);
+      else m.setLngLat([p.lon, p.lat]);
+      m.getElement().title = p.title || "";
+      return m;
+    }
+
+    return {
+      kind: "maplibre",
+      setBase(id) {
+        watchBase(id);
+        curBase = id;
+        map.setStyle(libreStyle(id), { diff: false });
+        tileCredit();
+      },
+      setCar(c) {
+        if (!c) { if (car) { car.remove(); car = null; } return; }
+        if (!car) {
+          const e = carElement();
+          e.title = "Your car";
+          car = new maplibregl.Marker({ element: e, rotationAlignment: "map", pitchAlignment: "map" })
+            .setLngLat([c.lon, c.lat]).addTo(map);
+        } else car.setLngLat([c.lon, c.lat]);
+        car.getElement().classList.toggle("noheading", c.heading == null);
+        if (c.heading != null) car.setRotation(c.heading);
+      },
+      setDest(d) { dest = setPin(dest, d, "dest-pin", "#ff5d5d"); },
+      setSearchPin(p) { pin = setPin(pin, p, "search-pin", "#f0b429"); },
+      setRoute(points) {
+        route = points;
+        const s = map.getSource(ROUTE_SRC);
+        if (s) s.setData(routeData());          // else the next style load adds it
+      },
+      openMenu(lat, lon, content, abovePin) {
+        this.closeMenu();
+        const p = popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, focusAfterOpen: false,
+          maxWidth: "300px", offset: abovePin ? 32 : 6, className: "bne-popup" });
+        p.setLngLat([lon, lat]).setDOMContent(content).addTo(map);
+        p.on("close", () => { if (popup === p) { popup = null; hooks.menuClosed(); } });
+      },
+      closeMenu() {
+        const p = popup;
+        popup = null;               // closed from here: no menuClosed back
+        if (p) p.remove();
+      },
+      // jumpTo stops every gesture in progress, even one not started yet (a button held before the drag threshold):
+      // the frames' soft calls wait while a pointer is down, the map moves or a wheel zoom is pending
+      centre(lat, lon, soft) {
+        if (soft && (pressed || map.isMoving() || map.scrollZoom.isActive())) return;
+        map.jumpTo({ center: [lon, lat] });
+      },
+      panTo(lat, lon) { map.panTo([lon, lat]); },
+      getView() {
+        const c = map.getCenter().wrap();
+        return { lat: c.lat, lon: c.lng, zoom: map.getZoom() + 1 };
+      },
+      setView(v) { map.jumpTo({ center: [v.lon, v.lat], zoom: Math.max(0, v.zoom - 1) }); },
+      // following: zoom about the middle (where the car is), not about the pointer
+      follow(on) {
+        const o = on ? { around: "center" } : undefined;
+        map.scrollZoom.disable(); map.scrollZoom.enable(o);
+        map.touchZoomRotate.disable(); map.touchZoomRotate.enable(o);
+      },
+      destroy() {
+        if (watch) clearTimeout(watch.timer);
+        watch = null;
+        lastAt = this.getView();
+        popup = null;
+        window.removeEventListener("pointerup", release, true);
+        window.removeEventListener("pointercancel", release, true);
+        map.remove();
+        box.remove();
+      },
+    };
+  }
+
+  // ---- Google Maps (phases 1 and 2), only with the player's own key; the script is loaded on first use
+  let googleLoad = null;          // the script's promise (loaded once per page)
+  let googleBad = false;          // Google refused the key (gm_authFailure): not tried again until a reload
 
   function loadGoogle(key) {
-    window.gm_authFailure = function () {
-      // Google tears the map down: touching it again (setCenter, marker positions) throws inside its code
-      map = null;
-      carMarker = destMarker = searchMarker = infoWin = null;
-      routeLine = routeCasing = null;
-      mapFailed("Google did not accept the API key. In Google Cloud check that the key may use the Maps JavaScript API, " +
-        "that billing is enabled, and that its website restriction allows " + SITE + (PHONE
-        ? " (this phone's address, besides the PC's). The key itself is replaced or removed on the PC."
-        : " . Replace or remove the key below."));
-      showKeyPanel(true);
-    };
-    window.__bneMapsReady = function () {
-      initMap().catch((e) => {
-        console.error(e);
-        mapFailed("Google Maps failed to start: " + (e && e.message ? e.message : e));
-      });
-    };
-    const p = new URLSearchParams();
-    if (key) p.set("key", key);
-    p.set("callback", "__bneMapsReady");
-    p.set("loading", "async");
-    p.set("v", "weekly");
-    p.set("libraries", "marker");
-    const s = document.createElement("script");
-    s.src = "https://maps.googleapis.com/maps/api/js?" + p.toString();
-    s.async = true;
-    s.onerror = () => mapFailed("Could not load Google Maps. Is the computer online? (An ad or script blocker can also stop it.)");
-    document.head.append(s);
-    setTimeout(() => {
-      if (!map && !mapsFailed) mapFailed("Google Maps did not load (timed out). Reload the page to try again.");
-    }, 30000);
+    if (googleLoad) return googleLoad;
+    googleLoad = new Promise((resolve, reject) => {
+      window.gm_authFailure = googleRefused;
+      window.__bneMapsReady = () => resolve();
+      const p = new URLSearchParams();
+      p.set("key", key);
+      p.set("callback", "__bneMapsReady");
+      p.set("loading", "async");
+      p.set("v", "weekly");
+      p.set("libraries", "marker");
+      const s = document.createElement("script");
+      s.src = "https://maps.googleapis.com/maps/api/js?" + p.toString();
+      s.async = true;
+      s.onerror = () => {
+        googleLoad = null;          // nothing loaded: the next try adds the script again
+        s.remove();
+        reject(new Error("Could not load Google Maps. Is the computer online? (An ad or script blocker can also stop it.)"));
+      };
+      document.head.append(s);
+      setTimeout(() => reject(new Error("Google Maps did not load (timed out). Reload the page to try again.")), 30000);
+    });
+    return googleLoad;
   }
 
-  async function initMap() {
+  function googleRefused() {
+    googleBad = true;
+    // Google tears its map down: touching it again (setCenter, marker positions) throws inside its code
+    if (view && view.kind === "google") { const v = view; view = null; v.destroy(true); }
+    if (base === "google") googleFailed(MSG_KEY_REFUSED);
+  }
+
+  // Google did not start or refused the key: the reason in the key panel, and the street map instead
+  function googleFailed(text) {
+    keyError(text);
+    showKeyPanel(true);
+    if (libreBroken) { mapMessage(text); return; }
+    toast("Google Maps is not available: showing the street map", true);
+    setBase("streets");
+  }
+
+  async function googleView(at) {
+    await loadGoogle(keyStored);
+    const core = await google.maps.importLibrary("core");
     const mapsLib = await google.maps.importLibrary("maps");
     let markerLib = null;
     try { markerLib = await google.maps.importLibrary("marker"); } catch (e) { console.warn("marker library", e); }
+    if (googleBad) throw new Error(MSG_KEY_REFUSED);
     // ?classic=1 forces the fallback (classic markers, no map ID) for testing
-    useAdvanced = !!(markerLib && markerLib.AdvancedMarkerElement) && !new URLSearchParams(location.search).has("classic");
-    const p = state && state.player;
+    const useAdvanced = !!(markerLib && markerLib.AdvancedMarkerElement) && !new URLSearchParams(location.search).has("classic");
+    const box = el("div", "mapview");
+    $("map").append(box);
     const opts = {
-      center: p && num(p.lat) ? { lat: p.lat, lng: p.lon } : { lat: 30, lng: 0 },
-      zoom: p && num(p.lat) ? FIRST_ZOOM : 3,
+      center: { lat: at.lat, lng: at.lon },
+      zoom: at.zoom,
       gestureHandling: "greedy",
       clickableIcons: false,          // Google's own places stay out of it: a click is always "here"
       streetViewControl: false,
       mapTypeControl: true,
+      // the top left corner holds the page's base map picker
+      mapTypeControlOptions: { position: core.ControlPosition.TOP_RIGHT },
       fullscreenControl: true,
       colorScheme: "DARK",
     };
     if (useAdvanced) opts.mapId = "DEMO_MAP_ID";      // AdvancedMarkerElement needs a map ID
-    map = new mapsLib.Map($("map"), opts);
-    infoWin = new mapsLib.InfoWindow({ headerDisabled: true });
-    infoWin.addListener("closeclick", closeMenu);
+    const map = new mapsLib.Map(box, opts);
+    const infoWin = new mapsLib.InfoWindow({ headerDisabled: true });
+    let car = null, carHeading = null, dest = null, pin = null, routeLine = null, routeCasing = null;
+    let lastIconHeading = NaN, last = at;
 
-    map.addListener("dragstart", () => { if (follow) setFollow(false); });
+    function classicPin(color, scale) {
+      return {
+        path: "M0,0 C-2,-14 -14,-16 -14,-26 A14,14 0 1,1 14,-26 C14,-16 2,-14 0,0 Z",
+        fillColor: color, fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2, scale: scale / 1.6,
+        anchor: new google.maps.Point(0, 0),
+      };
+    }
+    function carIcon(heading) {
+      if (!num(heading)) {
+        return { path: google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: "#3fa7ff", fillOpacity: 1,
+          strokeColor: "#ffffff", strokeWeight: 2.5 };
+      }
+      return { path: ARROW_PATH, rotation: heading, fillColor: "#3fa7ff", fillOpacity: 1, strokeColor: "#ffffff",
+        strokeWeight: 2.2, scale: 1.1, anchor: new google.maps.Point(0, 0) };
+    }
+
+    // one wrapper over both marker kinds: set(pos), setTitle(t), remove()
+    function makeMarker(pos, content, classicIcon, z) {
+      if (useAdvanced) {
+        const m = new google.maps.marker.AdvancedMarkerElement({ map: map, position: pos, content: content, zIndex: z });
+        return {
+          el: content,
+          set(p) { m.position = p; },
+          setTitle(t) { m.title = t; },
+          remove() { m.map = null; },
+        };
+      }
+      const m = new google.maps.Marker({ map: map, position: pos, icon: classicIcon, zIndex: z, clickable: false });
+      return {
+        m: m,
+        set(p) { m.setPosition(p); },
+        setTitle(t) { m.setTitle(t); },
+        remove() { m.setMap(null); },
+      };
+    }
+    function setPin(m, p, cls, color, scale, z) {
+      if (!p) { if (m) m.remove(); return null; }
+      const pos = { lat: p.lat, lng: p.lon };
+      if (m) m.set(pos);
+      else m = makeMarker(pos, pinElement(cls, color), classicPin(color, scale), z);
+      m.setTitle(p.title || "");
+      return m;
+    }
+
+    function rotateCar() {
+      if (!car) return;
+      const h = carHeading;
+      if (useAdvanced) {
+        car.el.classList.toggle("noheading", h == null);
+        // the arrow is in screen space: subtract the map's own rotation (vector maps can be rotated)
+        if (h != null) car.el.firstChild.style.transform = "rotate(" + (h - (map.getHeading() || 0)).toFixed(1) + "deg)";
+      } else {
+        // setIcon is not free: only when the heading changed visibly
+        const hv = h == null ? -1 : Math.round(h);
+        if (hv !== lastIconHeading) { lastIconHeading = hv; car.m.setIcon(carIcon(h)); }
+      }
+    }
+
+    infoWin.addListener("closeclick", () => hooks.menuClosed());
+    map.addListener("dragstart", () => hooks.dragstart());
     map.addListener("click", (e) => {
       if (e.placeId && e.stop) e.stop();
       if (!e.latLng) return;
-      hideResults();
-      if (searchMarker) { searchMarker.remove(); searchMarker = null; }
-      openMenu(e.latLng.lat(), e.latLng.lng(), null, null);
+      hooks.click(e.latLng.lat(), e.latLng.lng());
     });
     map.addListener("heading_changed", rotateCar);
 
-    if (shown) placeCar();
-    renderDest();
-    drawRoute();
+    return {
+      kind: "google",
+      setCar(c) {
+        if (!c) { if (car) { car.remove(); car = null; } return; }
+        carHeading = c.heading;
+        const pos = { lat: c.lat, lng: c.lon };
+        if (!car) {
+          car = makeMarker(pos, carElement(), carIcon(c.heading), 1000);
+          car.setTitle("Your car");
+          lastIconHeading = NaN;
+        } else car.set(pos);
+        rotateCar();
+      },
+      setDest(d) { dest = setPin(dest, d, "dest-pin", "#ff5d5d", 1.6, 900); },
+      setSearchPin(p) { pin = setPin(pin, p, "search-pin", "#f0b429", 1.1, 800); },
+      setRoute(points) {
+        if (!points.length) {
+          if (routeLine) routeLine.setMap(null);
+          if (routeCasing) routeCasing.setMap(null);
+          return;
+        }
+        const path = points.map((q) => ({ lat: q[0], lng: q[1] }));
+        if (!routeLine) {
+          routeCasing = new google.maps.Polyline({ map: map, path: path, strokeColor: "#0b3558", strokeOpacity: 0.9,
+            strokeWeight: 9, clickable: false, zIndex: 4 });
+          routeLine = new google.maps.Polyline({ map: map, path: path, strokeColor: "#3fa7ff", strokeOpacity: 1,
+            strokeWeight: 5, clickable: false, zIndex: 5 });
+        } else {
+          routeCasing.setPath(path); routeCasing.setMap(map);
+          routeLine.setPath(path); routeLine.setMap(map);
+        }
+      },
+      openMenu(lat, lon, content, abovePin) {
+        infoWin.setContent(content);
+        infoWin.setOptions({ pixelOffset: new google.maps.Size(0, abovePin ? -30 : 0) });
+        infoWin.setPosition({ lat: lat, lng: lon });
+        infoWin.open({ map: map });
+      },
+      closeMenu() { infoWin.close(); },
+      centre(lat, lon) { map.setCenter({ lat: lat, lng: lon }); },
+      panTo(lat, lon) { map.panTo({ lat: lat, lng: lon }); },
+      getView() {
+        try {
+          const c = map.getCenter();
+          if (c) last = { lat: c.lat(), lon: c.lng(), zoom: map.getZoom() };
+        } catch (e) { /* torn down by Google */ }
+        return last;
+      },
+      setView(v) { map.setCenter({ lat: v.lat, lng: v.lon }); map.setZoom(Math.round(v.zoom)); },
+      follow() { /* a setCenter does not stop Google's own zooming */ },
+      // dead: Google tore the map down (a refused key), nothing of it may be touched
+      destroy(dead) {
+        lastAt = this.getView();
+        if (!dead) {
+          try {
+            [car, dest, pin].forEach((m) => { if (m) m.remove(); });
+            if (routeLine) routeLine.setMap(null);
+            if (routeCasing) routeCasing.setMap(null);
+            infoWin.close();
+            google.maps.event.clearInstanceListeners(map);
+          } catch (e) { console.warn("Google Maps", e); }
+        }
+        box.remove();
+      },
+    };
   }
 
   // ------------------------------------------------------------------------------------------ the stream
@@ -834,11 +1332,11 @@
     $("lanRenew").textContent = on ? "New code" : "Turn on";
     $("lanRenew").disabled = false;
     $("lanStop").disabled = !on;
-    // the phone's address differs from the PC's: the key's website restriction must allow it too
+    // the phone's address differs from the PC's: a Google key's website restriction must allow it too
     let site = "";
     if (on) { try { site = "http://" + new URL(lan.url).host + "/*"; } catch (e) { /* not a URL: no hint */ } }
     $("lanSite").textContent = site;
-    $("lanKeyHint").hidden = !site;
+    $("lanKeyHint").hidden = !site || !keyStored;
     renderLanInfo();
   }
 
@@ -969,7 +1467,8 @@
     });
     document.addEventListener("keydown", (e) => {
       if (e.key !== "Escape") return;
-      if (!PHONE && lanOpen()) { closeLanBox(); return; }      // the box first, the click menu with the next one
+      if (pickerOpen()) { closePicker(); $("baseBtn").focus(); return; }   // the open list first,
+      if (!PHONE && lanOpen()) { closeLanBox(); return; }                   // then the box, then the click menu
       closeMenu();
     });
   }
@@ -997,6 +1496,7 @@
     wireButtons();
     wireSearch();
     wireKeyPanel();
+    wirePicker();
     if (!PHONE) wireLanBox();
     wireLifecycle();
     const s = await firstState();
@@ -1004,8 +1504,8 @@
     triedStream = false;
     unreachable = false;
     applyState(s);
-    setupKeyPanel(typeof s.apiKey === "string" ? s.apiKey : "");
-    loadGoogle(KEY_RE.test(s.apiKey || "") ? s.apiKey : "");
+    setupKeyPanel(typeof s.apiKey === "string" && KEY_RE.test(s.apiKey) ? s.apiKey : "");
+    setBase(firstBase());
     openStream();
   }
 

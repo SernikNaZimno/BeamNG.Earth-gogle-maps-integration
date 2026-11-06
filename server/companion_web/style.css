@@ -116,6 +116,17 @@ input:focus { outline: none; border-color: var(--accent); }
 /* ---- map area ---- */
 #main { flex: 1; position: relative; min-height: 0; }
 #map { position: absolute; inset: 0; background: #0d1014; }
+/* one renderer's own box inside #map (MapLibre's or Google's; two while switching) */
+.mapview { position: absolute; inset: 0; }
+/* the satellite map's imagery credit (only the sources the view shows): two lines, the whole text on a click */
+.tilecredit {
+  position: absolute; left: 8px; bottom: 10px; z-index: 2; max-width: min(520px, calc(100% - 60px));
+  padding: 3px 7px; border-radius: 6px; background: rgba(255, 255, 255, 0.82); color: #222; font-size: 11px;
+  line-height: 1.35; cursor: pointer; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.tilecredit.full { -webkit-line-clamp: unset; max-height: 50%; overflow-y: auto; }
+.tilecredit[hidden] { display: none; }
 
 .card {
   position: absolute;
@@ -142,6 +153,8 @@ input:focus { outline: none; border-color: var(--accent); }
   bottom: 30px;
   width: 380px;
   max-width: calc(100% - 20px);
+  max-height: calc(100% - 90px);    /* clear of the base map picker above it */
+  overflow-y: auto;
   padding: 12px 14px;
   font-size: 14px;
   line-height: 1.4;
@@ -152,7 +165,17 @@ input:focus { outline: none; border-color: var(--accent); }
 .cardhead { display: flex; justify-content: space-between; align-items: center; }
 #keyForm { display: flex; gap: 6px; }
 .error { color: var(--bad); margin-top: 6px; }
-#keyShow { left: 10px; bottom: 30px; padding: 5px 10px; font-size: 13px; }
+
+/* ---- the base map picker (top left: Google's own map type control is moved to the top right) ---- */
+#basePick { left: 10px; top: 10px; z-index: 6; padding: 0; border-radius: 6px; }
+#baseBtn { border: none; background: var(--panel); border-radius: 6px; font-weight: 600; }
+#baseBtn::after { content: " \25BE"; color: var(--dim); }
+#baseList { list-style: none; margin: 0; padding: 4px; border-top: 1px solid var(--line); min-width: 210px; }
+#baseList button { display: block; width: 100%; text-align: left; background: none; border-color: transparent; }
+#baseList button:hover { background: var(--panel2); }
+#baseList button.on { background: var(--accent2); border-color: var(--accent); }
+#baseList .keyitem { color: var(--dim); font-size: 13px; }
+#baseList li + li .keyitem { margin-top: 4px; }
 
 /* ---- the PC's phone box (the QR code: dark modules on white with its quiet zone, in both themes) ---- */
 #lanBox {
@@ -201,7 +224,8 @@ input:focus { outline: none; border-color: var(--accent); }
 .car {
   width: 40px;
   height: 40px;
-  /* AdvancedMarkerElement anchors the content's bottom centre at the position: move it down by half */
+  /* AdvancedMarkerElement anchors the content's bottom centre at the position: move it down by half
+     (MapLibre's marker sets its own transform on the element, anchored at the centre) */
   transform: translateY(50%);
   pointer-events: none;
 }
@@ -211,8 +235,14 @@ input:focus { outline: none; border-color: var(--accent); }
 .car.noheading .dot { display: inline; }
 .dest-pin svg { width: 30px; height: 40px; display: block; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, .6)); }
 .search-pin svg { width: 22px; height: 30px; display: block; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, .6)); }
+/* MapLibre: the markers are stacked by their DOM order; the car on top, the menu over all of them */
+.maplibregl-marker.car { z-index: 3; }
+.maplibregl-marker.dest-pin { z-index: 2; }
+.maplibregl-marker.search-pin { z-index: 1; }
+.maplibregl-popup.bne-popup { z-index: 4; }
+.bne-popup .maplibregl-popup-content { padding: 10px 12px; border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, .45); }
 
-/* ---- the click / search menu (inside Google's InfoWindow, which is white) ---- */
+/* ---- the click / search menu (inside Google's InfoWindow or MapLibre's popup, both white) ---- */
 .menu { color: #1b2027; font-size: 14px; min-width: 170px; }
 .menu .mt { font-weight: 700; margin-bottom: 2px; max-width: 240px; }
 .menu .mc { font-size: 12px; color: #5b6573; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
@@ -246,6 +276,9 @@ html.phone body { padding-left: env(safe-area-inset-left); padding-right: env(sa
 /* touch targets of 44 px; inputs at 16 px (smaller makes iOS zoom the page in on focus) */
 .phone button { min-height: 44px; padding: 8px 12px; }
 .phone button.link { min-height: 0; padding: 4px 0; }
+/* MapLibre's own controls keep their look (icon backgrounds), only bigger to tap */
+.phone .maplibregl-ctrl-group button { width: 40px; height: 40px; min-height: 0; padding: 0; }
+.phone .maplibregl-ctrl-attrib-button { min-height: 0; padding: 0; }
 .phone .unit { min-height: 38px; padding: 4px 10px; font-size: 14px; }
 .phone input { font-size: 16px; min-height: 44px; }
 .phone #results { top: 48px; max-height: 50vh; }
@@ -276,7 +309,6 @@ html.phone body { padding-left: env(safe-area-inset-left); padding-right: env(sa
 .phone .menu .mc { font-size: 13px; }
 .phone .menu .mb { gap: 8px; }
 .phone .menu button { padding: 10px 14px; font-size: 16px; }
-.phone #keyShow { min-height: 40px; bottom: 30px; }
 .phone #keyPanel { font-size: 15px; }
 @media (max-width: 700px) {
   .phone #bar { padding-left: 8px; padding-right: 8px; }

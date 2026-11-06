@@ -111,6 +111,8 @@ only, nothing redistributed. Licence notes marked *(verify)* must be re-checked 
 | LuaJIT | offline tests of the mod's Lua | MIT | in use (tests) |
 | GeographicLib (data files) | gravity model data | MIT (library) / NGA data public domain | in use |
 | Leaflet | world map page | BSD-2-Clause | not used: the in-game world map (`EarthMap.vue`, `mapmath.js`) is our own code. Its tiles come from the imagery chain above (USGS, EOX Sentinel-2 cloudless 2023 / 2016) through `server/maptiles.py` and show that same attribution, plus the EOX Terrain Light / Overlay layers above |
+| MapLibre GL JS 4.7.1 (https://github.com/maplibre/maplibre-gl-js) | the fork's live map page (`server/companion_web/vendor/maplibre-gl/`, bundled unchanged with its LICENSE.txt) | BSD-3-Clause | in use (fork) |
+| OpenFreeMap (https://openfreemap.org) | the live map page's street map, fetched by the player's browser; its tiles carry "OpenFreeMap © OpenMapTiles Data from OpenStreetMap", shown by the page | OpenStreetMap data ODbL; OpenMapTiles schema/styles BSD-3 / CC-BY 4.0 | in use (fork) |
 | DuckDB | reading Overture GeoParquet (`server/overture.py`; no extensions) | MIT | branch (feature/mapdata) |
 | fsspec | the filesystem interface DuckDB reads the remote files through (`server/rangeread.py`) | BSD-3-Clause | branch (feature/mapdata) |
 | Roadgeek 2014 Series EEM (`tools/fonts/RG2014EEM.ttf`, release 3.1, https://github.com/sammdot/roadgeek-fonts) | the highway signs' lettering: baked into one opacity atlas (`sign_letters_o.data.png`, `server/sign_glyphs.json`) by `tools/build_sign_glyphs.py`; the font file itself only in the repository | MIT, Copyright (c) 2015 Sammi De Guzman (`tools/fonts/Roadgeek-LICENSE.txt`, also beside the atlas in the mod) | dev (2026-10-28) |

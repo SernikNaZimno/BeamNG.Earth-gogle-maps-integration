@@ -4,12 +4,14 @@
 <meta charset="utf-8">
 <!-- viewport-fit=cover: a phone's notch / home bar are kept clear with env(safe-area-inset-*) in style.css -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<!-- the page's own URL holds the token (?t=): never send more than the origin as a referrer (Google's key
-     website restriction only needs the origin) -->
+<!-- the page's own URL holds the token (?t=): never send more than the origin as a referrer (OpenFreeMap, Google:
+     the key's website restriction only needs the origin) -->
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#1b2027">
 <title>BeamNG.Earth - Live map</title>
+<!-- phase 3: MapLibre GL JS 4.7.1, bundled (vendor/maplibre-gl/, BSD-3): the map without a key -->
+<link rel="stylesheet" href="vendor/maplibre-gl/maplibre-gl.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -41,12 +43,17 @@
 <main id="main">
   <div id="map"></div>
   <div id="message" class="card" hidden></div>
+  <!-- the base map picker (app.js fills the list: Streets, Satellite, Terrain, Google Maps with a key) -->
+  <div id="basePick" class="card">
+    <button id="baseBtn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="baseList" title="Base map">Streets</button>
+    <ul id="baseList" role="menu" aria-label="Base map" hidden></ul>
+  </div>
   <div id="keyPanel" class="card" hidden>
     <div class="cardhead">
       <strong>Google Maps API key</strong>
       <button id="keyHide" type="button" class="link" title="Hide this box">Hide</button>
     </div>
-    <p id="keyLead">Without a key Google shows a dimmed "for development purposes only" map. Paste your own key to get the full map.</p>
+    <p id="keyLead">The map works without a key. With your own Google Maps key, Google's map is one more base map: paste the key here.</p>
     <ol id="keySteps">
       <li>In <a href="https://console.cloud.google.com/google/maps-apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud</a>, enable the <b>Maps JavaScript API</b> and create an API key.</li>
       <li>Restrict the key: API restriction <b>Maps JavaScript API</b>; application restriction <b>Websites</b>: <code class="keysite"></code></li>
@@ -61,7 +68,6 @@
     <div id="keyError" class="error" hidden></div>
     <p id="keyStored" hidden>A key is stored. <button id="keyRemove" type="button" class="link">Remove the key</button></p>
   </div>
-  <button id="keyShow" type="button" class="card small" hidden>Google Maps key</button>
   <!-- the PC's Phone button: sharing over the local network (POST /api/lan) and the phone URL as a QR code -->
   <div id="lanBox" class="card" role="dialog" aria-labelledby="lanTitle" hidden>
     <div class="cardhead"><strong id="lanTitle">Live map on your phone</strong></div>
@@ -84,6 +90,7 @@
   </div>
   <div id="toast" role="status" aria-live="polite" hidden></div>
 </main>
+<script src="vendor/maplibre-gl/maplibre-gl.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

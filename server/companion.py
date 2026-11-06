@@ -1,14 +1,16 @@
-"""The live map in the browser (the fork's Google Maps integration, phases 1 and 2; the contract: docs/COMPANION.md).
+"""The live map in the browser (the fork's Google Maps integration, phases 1 to 3; the contract: docs/COMPANION.md).
 
 A small HTTP endpoint on 127.0.0.1 (as maptiles.py's: asyncio.start_server, one request per connection, the request
-parsed by hand, no new dependencies) serves a page (server/companion_web/) that shows the player's car on a Google map
-in the player's own browser (a second monitor), with the GPS destination and the planned route, and sends the game
-commands back (set / clear the destination, teleport, autodrive). earthd feeds it (update_pose, set_gps, set_route,
-set_connected) and gives it send_cmd(dict) -> bool, which passes a command to the game's connection (remote_cmd).
+parsed by hand, no new dependencies) serves a page (server/companion_web/) that shows the player's car on a map in the
+player's own browser (a second monitor), with the GPS destination and the planned route, and sends the game commands
+back (set / clear the destination, teleport, autodrive). earthd feeds it (update_pose, set_gps, set_route,
+set_connected) and gives it send_cmd(dict) -> bool, which passes a command to the game's connection (remote_cmd), and
+its maptiles.MapTiles (tiles: the in-game map's layers for the page's keyless base maps, phase 3; None without).
 
-HTTP (GET unless said; every answer Cache-Control: no-store, never any CORS header):
+HTTP (GET unless said; every answer Cache-Control: no-store but a tile's, never any CORS header):
   /, /index.html, /app.js, /style.css   the page's files from web_dir (404 for anything else, or while missing)
   /qrcode.js                            the PC page's phone QR code (a byte-identical copy of the mod's qrcode.js)
+  /vendor/maplibre-gl/...               MapLibre GL JS (maplibre-gl.js, maplibre-gl.css, LICENSE.txt), bundled
   /api/state?t=                         the state (state()) as JSON
   /api/events?t=                        text/event-stream: "state" (at once, then on a change, at most 4 a second:
                                         changes in between are coalesced into the next one), "route" (at once when
@@ -17,6 +19,12 @@ HTTP (GET unless said; every answer Cache-Control: no-store, never any CORS head
   POST /api/key                         the player's Maps JavaScript API key, stored in <user dir>/google_maps_key.txt
   /api/search?t=&q=                     Photon's results (geocode.search, biased to the player)
   /api/lan?t=, POST /api/lan            the phone over the local network: its state / {"on"} or {"renew"} (lan_info)
+  /api/tiles/{layer}/{z}/{x}/{y}?t=     a map tile (layer sat / map / labels: MapTiles.layer_tile, TILES_AT_ONCE at
+                                        once; Cache-Control: private, max-age=3600); 404 none there or no map tiles,
+                                        503 the fetch failed (retry later)
+  /api/attribution?t=                   {"attribution": the tiles' credit ("" without map tiles), "areas": the
+                                        imagery sources' credits by area (imagery.credits_by_area: [[credit, w, s, e,
+                                        n] or [credit]]; the page credits only those its view shows)}
 
 Checks, in this order: the Host header must be 127.0.0.1:<port> or localhost:<port> (421 otherwise: a page on another
 site that rebinds its name to 127.0.0.1 would send its own name), every /api/ request must carry the token (?t= on GET:
@@ -34,7 +42,9 @@ phone token (the PC token is refused there, the phone token on 127.0.0.1) (403),
 (companion_lan_state to the game) when it, or the phone token, changes.
 
 Everything runs on earthd's event loop (the feeds are called from the connection's message dispatch, send_cmd writes
-to the game's connection directly); only the search runs in an executor (it blocks on Photon).
+to the game's connection directly); only the search (it blocks on Photon) runs in an executor, and the tiles (they
+block on the imagery sources) in a pool of their own (a map full of tiles never holds up a search, nor the default
+pool's block builds).
 """
 import asyncio
 import collections
@@ -49,6 +59,10 @@ import socket
 import time
 from urllib.parse import parse_qs, urlsplit
 
+import imagery as imagerymod
+import maptiles as maptilesmod
+from runtimeprofiler import ThreadPoolExecutor
+
 log = logging.getLogger("earthd.companion")
 
 DEFAULT_PORT = 47616            # --companion-port (0 = off); the Google Cloud key's website restriction names it
@@ -58,7 +72,12 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8"),
-          "/qrcode.js": ("qrcode.js", "text/javascript; charset=utf-8")}
+          "/qrcode.js": ("qrcode.js", "text/javascript; charset=utf-8"),
+          # MapLibre GL JS 4.7.1 (BSD-3; the npm package's dist/, unchanged): the keyless map (phase 3)
+          "/vendor/maplibre-gl/maplibre-gl.js": ("vendor/maplibre-gl/maplibre-gl.js",
+                                                 "text/javascript; charset=utf-8"),
+          "/vendor/maplibre-gl/maplibre-gl.css": ("vendor/maplibre-gl/maplibre-gl.css", "text/css; charset=utf-8"),
+          "/vendor/maplibre-gl/LICENSE.txt": ("vendor/maplibre-gl/LICENSE.txt", "text/plain; charset=utf-8")}
 MAX_REQUEST = 8192              # bytes of request head accepted
 MAX_BODY = 4096                 # bytes of a POST body accepted (413 beyond)
 READ_TIMEOUT_S = 10
@@ -71,6 +90,12 @@ Q_MIN, Q_MAX = 3, 200           # a search's query, characters
 SEARCH_MAX = 20                 # results passed on
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{20,80}")
 ACTIONS = ("gps", "clear_gps", "teleport", "autodrive")
+# the keyless map's tiles (phase 3)
+TILES_PATH = "/api/tiles/"
+TILE_TYPES = {"jpg": "image/jpeg", "png": "image/png"}      # maptiles.LAYERS' file extension -> content type
+TILE_RE = re.compile(r"/api/tiles/([a-z]+)/([0-9]{1,2})/([0-9]{1,6})/([0-9]{1,6})")    # no extension, no more
+TILES_AT_ONCE = 6               # tiles fetched at once (more wait; a browser asks for dozens): a pool of their own
+TILE_CACHE = "private, max-age=3600"    # a tile's Cache-Control (only a served tile's: every other answer no-store)
 REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
            409: "Conflict", 411: "Length Required", 413: "Payload Too Large", 421: "Misdirected Request",
            429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
@@ -288,11 +313,30 @@ def parse_head(head):
     return method, target, headers
 
 
-def response(status, ctype, body, extra=()):
+def response(status, ctype, body, extra=(), cache="no-store"):
     """The bytes of a whole answer (Connection: close: one request per connection)."""
     hdr = [f"HTTP/1.1 {status} {REASONS.get(status, '')}", f"Content-Type: {ctype}", f"Content-Length: {len(body)}",
-           "Cache-Control: no-store", "X-Content-Type-Options: nosniff", *extra, "Connection: close", "", ""]
+           f"Cache-Control: {cache}", "X-Content-Type-Options: nosniff", *extra, "Connection: close", "", ""]
     return "\r\n".join(hdr).encode("latin-1") + body
+
+
+def cache_of(path, status):
+    """An answer's Cache-Control: TILE_CACHE for a served tile (the browser keeps it an hour: panning back over a
+    place fetches nothing), no-store for everything else (a 404 / 503 tile too: asked again later)."""
+    return TILE_CACHE if status == 200 and path.startswith(TILES_PATH) else "no-store"
+
+
+def parse_tile(path):
+    """/api/tiles/{layer}/{z}/{x}/{y} -> (layer, z, x, y) (z / x / y checked by maptiles.check_tile); None for any
+    other path (an unknown layer, an extension, a tile outside the world: 404)."""
+    m = TILE_RE.fullmatch(path)
+    if m is None or m.group(1) not in maptilesmod.LAYERS:
+        return None
+    try:
+        z, x, y = maptilesmod.check_tile(*m.group(2, 3, 4))
+    except maptilesmod.BadTile:
+        return None
+    return m.group(1), z, x, y
 
 
 def _json(status, obj):
@@ -315,16 +359,21 @@ class Companion:
     """The live map's HTTP endpoint and its state (module docstring). send_cmd(dict) -> bool passes a command to the
     game (False: no game connected, 409); search(q, lat, lon) -> [{"name", "detail", "lat", "lon", ...}] blocks (run
     in executor, None: the loop's default) and raises on failure (SearchError: its text is the page's). lan_ip: the
-    --companion-lan-ip override; on_lan_change(): the phone sharing's on / phones / token changed (lan_info())."""
+    --companion-lan-ip override; on_lan_change(): the phone sharing's on / phones / token changed (lan_info()).
+    tiles: earthd's maptiles.MapTiles (layer_tile blocks: run in a pool of TILES_AT_ONCE threads, made at the first
+    tile; attribution()), None without map tiles (--map-tiles off, no imagery); an attribute earthd may set later."""
 
     def __init__(self, user_dir, web_dir=WEB_DIR, token=None, search=None, send_cmd=None, executor=None,
-                 clock=time.monotonic, wall=time.time, lan_ip=None, on_lan_change=None):
+                 clock=time.monotonic, wall=time.time, lan_ip=None, on_lan_change=None, tiles=None):
         self.user_dir = user_dir
         self.web_dir = web_dir
         self.token = token or secrets.token_urlsafe(18)
         self.search = search
         self.send_cmd = send_cmd
         self.executor = executor
+        self.tiles = tiles
+        self._tile_pool = None
+        self._tile_sem = None
         self.clock, self.wall = clock, wall
         self.port = None
         self.state_gap_s, self.ping_s = STATE_GAP_S, PING_S
@@ -381,7 +430,7 @@ class Companion:
         """The state snapshot (/api/state, the "state" event; docs/COMPANION.md "State")."""
         return {"v": 1, "connected": self.connected, "player": self.player, "gps": self.gps,
                 "routeVersion": self.route_version, "apiKey": self.api_key,
-                "lan": {"on": self.lan_on, "phones": self.phones()}}
+                "lan": {"on": self.lan_on, "phones": self.phones()}, "tiles": self.tiles is not None}
 
     def route_event(self):
         return {"version": self.route_version, "points": self.route}
@@ -522,8 +571,15 @@ class Companion:
             return 404, "text/plain; charset=utf-8", b"not found"
         if path == "/api/lan" and method in ("GET", "HEAD"):     # (GET and POST: the PC's Phone box)
             return _json(200, self.lan_info())
+        if path.startswith(TILES_PATH):
+            tile = parse_tile(path)
+            if tile is None:
+                return 404, "text/plain; charset=utf-8", b"not a tile"
+            if method not in ("GET", "HEAD"):
+                return _json(405, {"ok": False, "error": "GET only"})
+            return await self._tile(*tile)
         want = {"/api/state": "GET", "/api/events": "GET", "/api/search": "GET", "/api/cmd": "POST",
-                "/api/key": "POST", "/api/lan": "POST"}.get(path)
+                "/api/key": "POST", "/api/lan": "POST", "/api/attribution": "GET"}.get(path)
         if want is None:
             return 404, "text/plain; charset=utf-8", b"not found"
         if method != want and not (want == "GET" and method == "HEAD"):
@@ -534,6 +590,8 @@ class Companion:
             return _json(400, {"ok": False, "error": "an event stream: GET it"})
         if path == "/api/search":
             return await self._search((query.get("q") or [""])[0])
+        if path == "/api/attribution":
+            return _json(200, {"attribution": self._attribution(), "areas": self._credit_areas()})
         try:
             data = json.loads(body.decode("utf-8")) if body else None
         except (UnicodeDecodeError, ValueError):
@@ -608,6 +666,51 @@ class Companion:
                 break
         return _json(200, {"results": out})
 
+    async def _tile(self, layer, z, x, y):
+        """A map tile's answer (parse_tile's fields): MapTiles.layer_tile in the tile pool, TILES_AT_ONCE at once (the
+        rest wait here, on the loop); 404 none there or no map tiles, 503 the fetch failed, 500 anything else (as
+        MapTiles.respond)."""
+        tiles = self.tiles
+        if tiles is None:
+            return 404, "text/plain; charset=utf-8", b"no map tiles on this server"
+        if self._closed:                            # (the server stopping: its pool is shut down)
+            return 503, "text/plain; charset=utf-8", b"the live map is off"
+        if self._tile_sem is None:
+            self._tile_sem = asyncio.Semaphore(TILES_AT_ONCE)
+            self._tile_pool = ThreadPoolExecutor(TILES_AT_ONCE, thread_name_prefix="live-map-tiles")
+        async with self._tile_sem:
+            try:
+                data = await asyncio.get_running_loop().run_in_executor(self._tile_pool, tiles.layer_tile, layer,
+                                                                        z, x, y)
+            except imagerymod.ImageryError as e:    # a source unreachable: the page asks again later
+                return 503, "text/plain; charset=utf-8", str(e).encode("utf-8", "replace")
+            except Exception as e:                  # never take the endpoint down for a map tile
+                log.exception("live map tile %s/%s/%s/%s failed", layer, z, x, y)
+                return 500, "text/plain; charset=utf-8", f"{type(e).__name__}: {e}".encode("utf-8", "replace")
+        if not data:
+            return 404, "text/plain; charset=utf-8", b"no tile here"
+        return 200, TILE_TYPES[maptilesmod.LAYERS[layer]], bytes(data)
+
+    def _attribution(self):
+        tiles = self.tiles
+        if tiles is None:
+            return ""
+        try:
+            return str(tiles.attribution() or "")
+        except Exception as e:      # (never the page's business)
+            log.debug("live map attribution: %s", e)
+            return ""
+
+    def _credit_areas(self):
+        imagery = getattr(self.tiles, "imagery", None)
+        if imagery is None:
+            return []
+        try:
+            return list(imagery.credits_by_area())
+        except Exception as e:      # (the page falls back to the whole line)
+            log.debug("live map credit areas: %s", e)
+            return []
+
     # --- the socket side --------------------------------------------------------------------------------------------
     async def handle(self, reader, writer, lan=False):
         """One connection (one request, or an event stream); lan: it came to the LAN listener."""
@@ -655,7 +758,7 @@ class Companion:
             if (status, ctype, out) == CLOSED:
                 return
             extra = ("Referrer-Policy: strict-origin-when-cross-origin",) if ctype.startswith("text/html") else ()
-            data = response(status, ctype, out, extra)
+            data = response(status, ctype, out, extra, cache_of(parts.path, status))
             if method == "HEAD":
                 data = data[:len(data) - len(out)]
             await self._write(writer, data)
@@ -736,11 +839,14 @@ class Companion:
         return srv, self.port
 
     def close(self):
-        """Ends the open streams (the server's own close() does not end its handlers) and the phone sharing."""
+        """Ends the open streams (the server's own close() does not end its handlers), the phone sharing and the
+        tile pool (a tile being fetched still finishes)."""
         self._closed = True
         self._lan_off()
         for st in self._streams:
             st.wake.set()
+        if self._tile_pool is not None:
+            self._tile_pool.shutdown(wait=False)
 
     # --- the phone over the local network (phase 2) ---------------------------------------------------------------
     def lan_info(self):

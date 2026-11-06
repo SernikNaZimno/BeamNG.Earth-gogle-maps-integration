@@ -7187,10 +7187,11 @@ async def main_async(args):
     comp_srv = None
     if getattr(args, "companion_port", 0):
         # the live map in the browser (companion.py), 127.0.0.1 only; a port in use (a second server, another app)
-        # only loses it: hello then has no "companion" and the mod no Live map button
+        # only loses it: hello then has no "companion" and the mod no Live map button. Its keyless base maps get
+        # the world map's tiles (server.map_tiles, made above; None: --map-tiles off or no imagery, state.tiles false)
         comp = companionmod.Companion(args.user_dir, search=server.companion_search, send_cmd=server.companion_cmd,
                                       executor=server.ui_pool, lan_ip=getattr(args, "companion_lan_ip", None),
-                                      on_lan_change=server.companion_lan_push)
+                                      on_lan_change=server.companion_lan_push, tiles=server.map_tiles)
         try:
             comp_srv, _ = await comp.start(args.companion_port)
             server.companion = comp
